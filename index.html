@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VoxScribe - Real-Time Multilingual Speech-to-Text</title>
+  
+  <!-- Google Fonts: Inter, Noto Sans Malayalam, Noto Sans Arabic for pixel-perfect script rendering -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+Arabic:wght@400;600;700&family=Noto+Sans+Malayalam:wght@400;600;700&display=swap" rel="stylesheet">
+  
+  <!-- Tailwind CSS via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            malayalam: ['"Noto Sans Malayalam"', 'sans-serif'],
+            arabic: ['"Noto Sans Arabic"', 'sans-serif'],
+          },
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              100: '#e0e7ff',
+              400: '#818cf8',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <!-- html2pdf.js for 100% accurate Unicode PDF generation (Arabic RTL + Malayalam ligatures) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
+  <!-- Custom Stylesheet -->
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans antialiased selection:bg-indigo-500 selection:text-white">
+
+  <!-- Notification Toast -->
+  <div id="toast" class="fixed top-5 right-5 z-50 transform translate-y-[-120%] opacity-0 transition-all duration-300 ease-out flex items-center gap-3 px-4 py-3 rounded-xl shadow-2xl backdrop-blur-md border">
+    <i id="toastIcon" data-lucide="check-circle" class="w-5 h-5"></i>
+    <span id="toastMsg" class="text-sm font-medium">Notification</span>
+  </div>
+
+  <!-- Header -->
+  <header class="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-md sticky top-0 z-40">
+    <div class="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-indigo-500/25">
+          <i data-lucide="mic" class="w-5 h-5 text-white"></i>
+        </div>
+        <div>
+          <h1 class="text-lg font-bold bg-gradient-to-r from-white via-slate-200 to-indigo-300 bg-clip-text text-transparent leading-none">
+            VoxScribe Live
+          </h1>
+          <p class="text-xs text-slate-400 mt-1">Real-Time Malayalam • Arabic • English Transcription</p>
+        </div>
+      </div>
+
+      <!-- Live Engine Status & Language Mode -->
+      <div class="flex items-center gap-3">
+        <!-- Status Indicator Pill -->
+        <div id="statusBadge" class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-800/80 border border-slate-700/60 text-slate-300">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+          <span id="statusText">Ready</span>
+        </div>
+
+        <!-- Language Mode Selector -->
+        <div class="hidden sm:flex items-center bg-slate-800/90 p-1 rounded-xl border border-slate-700/60 text-xs">
+          <button id="langAutoBtn" class="lang-tab active px-3 py-1 rounded-lg font-medium transition-all" data-lang="auto">
+            ⚡ Auto-Detect
+          </button>
+          <button id="langMlBtn" class="lang-tab px-3 py-1 rounded-lg font-medium transition-all" data-lang="ml-IN">
+            മലയാളം
+          </button>
+          <button id="langArBtn" class="lang-tab px-3 py-1 rounded-lg font-medium transition-all" data-lang="ar-SA">
+            العربية
+          </button>
+          <button id="langEnBtn" class="lang-tab px-3 py-1 rounded-lg font-medium transition-all" data-lang="en-US">
+            English
+          </button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="flex-1 max-w-6xl w-full mx-auto px-4 py-6 flex flex-col gap-6">
+
+    <!-- Top Hero / Control Center -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
+      
+      <!-- Microphone & Recording Center (5 Cols) -->
+      <div class="lg:col-span-5 bg-gradient-to-b from-slate-900/90 to-slate-900/40 border border-slate-800/80 rounded-2xl p-6 flex flex-col items-center justify-between shadow-xl relative overflow-hidden backdrop-blur-sm">
+        
+        <!-- Ambient decorative glow -->
+        <div id="ambientGlow" class="absolute w-60 h-60 rounded-full bg-indigo-500/10 blur-3xl -top-10 -left-10 pointer-events-none transition-all duration-700"></div>
+
+        <div class="w-full flex items-center justify-between mb-4">
+          <span class="text-xs uppercase tracking-wider font-semibold text-slate-400 flex items-center gap-1.5">
+            <i data-lucide="radio" class="w-3.5 h-3.5 text-indigo-400"></i> Audio Stream
+          </span>
+          <div id="timerDisplay" class="text-xs font-mono font-semibold px-2.5 py-1 rounded-md bg-slate-800/80 border border-slate-700/60 text-slate-300">
+            00:00
+          </div>
+        </div>
+
+        <!-- Big Mic Button with Pulsing Wave Rings -->
+        <div class="relative my-4 flex items-center justify-center">
+          <div id="micRing1" class="absolute w-36 h-36 rounded-full border border-indigo-500/20 scale-100 opacity-0 transition-all duration-500"></div>
+          <div id="micRing2" class="absolute w-44 h-44 rounded-full border border-indigo-500/10 scale-100 opacity-0 transition-all duration-700"></div>
+
+          <button id="toggleRecordBtn" class="relative group z-10 w-24 h-24 rounded-full bg-gradient-to-tr from-indigo-600 to-indigo-500 text-white flex items-center justify-center shadow-xl shadow-indigo-600/30 hover:scale-105 active:scale-95 transition-all duration-300 focus:outline-none focus:ring-4 focus:ring-indigo-500/40">
+            <i id="micIcon" data-lucide="mic" class="w-10 h-10 text-white transition-transform duration-300"></i>
+          </button>
+        </div>
+
+        <div class="text-center mt-2 mb-3">
+          <h2 id="micActionHeading" class="text-base font-semibold text-white">Click Start or Mic to Record</h2>
+          <p id="micActionSub" class="text-xs text-slate-400 mt-0.5">Speak naturally in Malayalam, Arabic, or English</p>
+        </div>
+
+        <!-- Start & Pause Buttons -->
+        <div class="flex items-center gap-2.5 mb-4 w-full max-w-xs justify-center">
+          <button id="startBtn" class="flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-xl font-semibold text-xs text-white bg-emerald-600 hover:bg-emerald-500 active:scale-95 transition-all shadow-md shadow-emerald-600/25 disabled:opacity-40 disabled:cursor-not-allowed">
+            <i data-lucide="play" class="w-3.5 h-3.5 fill-current"></i>
+            <span>Start</span>
+          </button>
+          
+          <button id="pauseBtn" disabled class="flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-xl font-semibold text-xs text-slate-300 bg-slate-800 hover:bg-slate-700 active:scale-95 transition-all border border-slate-700 disabled:opacity-40 disabled:cursor-not-allowed">
+            <i data-lucide="pause" class="w-3.5 h-3.5 fill-current"></i>
+            <span>Pause</span>
+          </button>
+        </div>
+
+        <!-- Live Sound Visualizer Canvas -->
+        <div class="w-full bg-slate-950/60 rounded-xl p-2.5 border border-slate-800 flex flex-col items-center gap-1.5">
+          <canvas id="visualizerCanvas" width="340" height="42" class="w-full h-11 rounded"></canvas>
+          <div class="w-full flex justify-between text-[10px] text-slate-500 font-mono">
+            <span>MIC LEVEL</span>
+            <span id="decibelLevel">-∞ dB</span>
+          </div>
+        </div>
+
+        <!-- Mobile Language Selector Dropdown -->
+        <div class="w-full mt-4 sm:hidden">
+          <label class="text-[11px] text-slate-400 mb-1 block">Language Setting:</label>
+          <select id="mobileLangSelect" class="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2">
+            <option value="auto">⚡ Auto-Detect</option>
+            <option value="ml-IN">മലയാളം (Malayalam)</option>
+            <option value="ar-SA">العربية (Arabic)</option>
+            <option value="en-US">English</option>
+          </select>
+        </div>
+
+      </div>
+
+      <!-- Real-Time Live Transcript Section (7 Cols) -->
+      <div class="lg:col-span-7 bg-slate-900/90 border border-slate-800/80 rounded-2xl flex flex-col shadow-xl backdrop-blur-sm overflow-hidden">
+        
+        <!-- Card Header & Metadata Badges -->
+        <div class="px-5 py-4 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3 bg-slate-900/50">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-semibold text-white flex items-center gap-2">
+              <i data-lucide="file-text" class="w-4 h-4 text-indigo-400"></i> Live Transcript
+            </span>
+            <!-- Live Detected Language Badge -->
+            <span id="detectedLangBadge" class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-indigo-950/60 border border-indigo-700/50 text-indigo-300">
+              <span class="w-1.5 h-1.5 rounded-full bg-indigo-400"></span>
+              <span id="detectedLangText">Detecting...</span>
+            </span>
+          </div>
+
+          <!-- Stats: Word Counter & Characters -->
+          <div class="flex items-center gap-3 text-xs text-slate-300 font-mono bg-slate-950/50 px-3 py-1.5 rounded-lg border border-slate-800">
+            <span class="flex items-center gap-1.5">
+              <i data-lucide="align-left" class="w-3.5 h-3.5 text-indigo-400"></i>
+              <span>Word Counter:</span>
+              <strong id="wordCount" class="text-indigo-300 font-bold text-sm">0</strong>
+            </span>
+            <span class="text-slate-600">•</span>
+            <span>Chars: <strong id="charCount" class="text-slate-300 font-semibold">0</strong></span>
+          </div>
+        </div>
+
+        <!-- Editable Transcript Area -->
+        <div class="flex-1 p-5 min-h-[300px] max-h-[460px] overflow-y-auto relative flex flex-col" id="transcriptScrollContainer">
+          
+          <!-- Empty State Placeholder -->
+          <div id="emptyPlaceholder" class="flex-1 flex flex-col items-center justify-center text-center p-6 text-slate-500">
+            <div class="w-12 h-12 rounded-2xl bg-slate-800/60 border border-slate-700/50 flex items-center justify-center mb-3 text-slate-400">
+              <i data-lucide="mic-off" class="w-6 h-6"></i>
+            </div>
+            <p class="text-sm font-medium text-slate-400">No voice recorded yet</p>
+            <p class="text-xs text-slate-500 mt-1 max-w-sm">
+              Press the microphone and start speaking. Your speech will be transcribed in real time.
+            </p>
+          </div>
+
+          <!-- Live Transcript Content (Editable) -->
+          <div id="transcriptContent" 
+               contenteditable="true" 
+               spellcheck="false"
+               dir="ltr"
+               class="flex-1 hidden outline-none text-base sm:text-lg leading-relaxed text-slate-100 font-normal focus:ring-0 whitespace-pre-wrap transition-all">
+          </div>
+
+          <!-- Interim (Unfinalized) Real-time Speech Preview -->
+          <div id="interimPreview" 
+               dir="ltr" 
+               class="hidden text-base sm:text-lg text-indigo-300/80 italic whitespace-pre-wrap transition-opacity duration-150 mt-1 border-l-2 border-indigo-500/60 pl-2">
+          </div>
+
+        </div>
+
+        <!-- Transcript Actions Toolbar -->
+        <div class="px-5 py-3 border-t border-slate-800/80 bg-slate-900/60 flex flex-wrap items-center justify-between gap-2">
+          <div class="flex items-center gap-2">
+            <!-- Clear Button -->
+            <button id="clearBtn" class="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 border border-transparent hover:border-rose-500/30 transition-all">
+              <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+              <span>Clear</span>
+            </button>
+            <span class="text-xs text-slate-600 hidden sm:inline">|</span>
+            <span class="text-[11px] text-slate-500 hidden sm:inline">Click transcript text to edit</span>
+          </div>
+
+          <div class="flex items-center flex-wrap gap-2">
+            <!-- Copy to Clipboard Button -->
+            <button id="copyBtn" class="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 hover:text-white transition-all active:scale-95 shadow-sm">
+              <i id="copyIcon" data-lucide="copy" class="w-3.5 h-3.5"></i>
+              <span id="copyBtnText">Copy to Clipboard</span>
+            </button>
+
+            <!-- Download .TXT Button -->
+            <button id="downloadTxtBtn" class="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white shadow-md shadow-emerald-600/20 transition-all active:scale-95">
+              <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
+              <span>Download .TXT</span>
+            </button>
+
+            <!-- Download PDF Button -->
+            <button id="downloadPdfBtn" class="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white shadow-md shadow-indigo-600/30 transition-all active:scale-95">
+              <i data-lucide="download" class="w-3.5 h-3.5"></i>
+              <span>Download PDF</span>
+            </button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Features & Multi-Language Support Info Grid -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      
+      <!-- Malayalam Card -->
+      <div class="p-4 rounded-xl bg-slate-900/40 border border-slate-800/70 hover:border-slate-700/80 transition-all">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-bold uppercase tracking-wider text-emerald-400">Malayalam (മലയാളം)</span>
+          <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-800/50 text-emerald-300">ml-IN</span>
+        </div>
+        <p class="text-xs text-slate-400 leading-relaxed font-malayalam">
+          പൂർണ്ണമായും സങ്കീർണ്ണമായ കൂട്ടക്ഷരങ്ങളും ചില്ലക്ഷരങ്ങളും കൃത്യമായി തിരിച്ചറിയുന്നു.
+        </p>
+      </div>
+
+      <!-- Arabic Card -->
+      <div class="p-4 rounded-xl bg-slate-900/40 border border-slate-800/70 hover:border-slate-700/80 transition-all">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-bold uppercase tracking-wider text-amber-400">Arabic (العربية)</span>
+          <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-amber-950/60 border border-amber-800/50 text-amber-300">ar-SA</span>
+        </div>
+        <p class="text-xs text-slate-400 leading-relaxed font-arabic text-right" dir="rtl">
+          التعرف التلقائي الذكي على اللغة وتوجيه النص من اليمين إلى اليسار (RTL).
+        </p>
+      </div>
+
+      <!-- English Card -->
+      <div class="p-4 rounded-xl bg-slate-900/40 border border-slate-800/70 hover:border-slate-700/80 transition-all">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-bold uppercase tracking-wider text-sky-400">English</span>
+          <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-950/60 border border-sky-800/50 text-sky-300">en-US / en-IN</span>
+        </div>
+        <p class="text-xs text-slate-400 leading-relaxed">
+          High-accuracy real-time punctuation and phonetic transcription streaming.
+        </p>
+      </div>
+
+    </div>
+
+  </main>
+
+  <!-- Hidden Offscreen Container for Clean PDF Generation -->
+  <div id="pdfExportTemplate" class="fixed left-[-9999px] top-0 w-[780px] bg-white text-slate-900 p-10 font-sans">
+    <div style="border-bottom: 2px solid #e2e8f0; padding-bottom: 16px; margin-bottom: 20px;">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div>
+          <h1 style="font-size: 24px; font-weight: 700; color: #1e1b4b; margin: 0;">VoxScribe Voice Transcript</h1>
+          <p style="font-size: 12px; color: #64748b; margin-top: 4px;">Real-Time Multilingual Speech-to-Text Document</p>
+        </div>
+        <div style="text-align: right; font-size: 11px; color: #64748b;">
+          <div><strong style="color: #334155;">Generated:</strong> <span id="pdfDate"></span></div>
+          <div><strong style="color: #334155;">Primary Script:</strong> <span id="pdfLang"></span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Transcript Body -->
+    <div id="pdfTranscriptContent" style="font-size: 15px; line-height: 1.8; color: #1e293b; min-height: 350px; white-space: pre-wrap; font-family: 'Inter', 'Noto Sans Malayalam', 'Noto Sans Arabic', sans-serif;">
+    </div>
+
+    <!-- Footer -->
+    <div style="border-top: 1px solid #e2e8f0; margin-top: 30px; padding-top: 12px; display: flex; justify-content: space-between; font-size: 10px; color: #94a3b8;">
+      <span>Transcribed with VoxScribe Multilingual AI Engine</span>
+      <span id="pdfStats"></span>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer class="border-t border-slate-800/60 py-4 bg-slate-950/80">
+    <div class="max-w-6xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
+      <p>© 2026 VoxScribe. Instant Live Audio to Text.</p>
+      <div class="flex items-center gap-4">
+        <span>Runs locally in browser</span>
+        <span>•</span>
+        <span>Secure & Private (Zero Audio Saved)</span>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Application Logic -->
+  <script src="app.js"></script>
+</body>
+</html>
+

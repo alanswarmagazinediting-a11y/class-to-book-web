@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Live Speech-to-Text Transcriber</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Font Awesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+    <!-- Google Fonts Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
+        rel="stylesheet" />
+
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+
+        /* Pulse animation for active recording */
+        @keyframes pulse-ring {
+            0% {
+                transform: scale(0.95);
+                opacity: 0.8;
+            }
+
+            50% {
+                transform: scale(1.15);
+                opacity: 0.4;
+            }
+
+            100% {
+                transform: scale(0.95);
+                opacity: 0.8;
+            }
+        }
+
+        .animate-recording {
+            animation: pulse-ring 1.8s infinite ease-in-out;
+        }
+
+        /* Custom scrollbar for transcript container */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #f1f5f9;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+    </style>
+</head>
+
+<body
+    class="bg-slate-50 text-slate-800 min-h-screen flex flex-col justify-between selection:bg-indigo-100 selection:text-indigo-700">
+
+    <!-- Header -->
+    <header class="bg-white border-b border-slate-200 sticky top-0 z-10 shadow-sm">
+        <div class="max-w-5xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div
+                    class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center text-white shadow-md shadow-indigo-200">
+                    <i class="fa-solid font-bold fa-microphone-lines text-lg"></i>
+                </div>
+                <div>
+                    <h1 class="text-xl font-bold text-slate-900 leading-tight">VoxScribe</h1>
+                    <p class="text-xs text-slate-500 font-medium">Real-time Web Speech Transcription</p>
+                </div>
+            </div>
+
+            <!-- Language Selector -->
+            <div class="flex items-center space-x-2">
+                <label for="languageSelect"
+                    class="hidden sm:inline-block text-xs font-semibold text-slate-500 uppercase tracking-wider">Language:</label>
+                <div class="relative">
+                    <select id="languageSelect"
+                        class="bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-medium rounded-lg px-3 py-2 pr-8 border border-slate-200 appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer transition">
+                        <option value="en-US">English (US)</option>
+                        <option value="en-GB">English (UK)</option>
+                        <option value="es-ES">Spanish (Spain)</option>
+                        <option value="fr-FR">French</option>
+                        <option value="de-DE">German</option>
+                        <option value="hi-IN">Hindi</option>
+                        <option value="ml-IN">Malayalam</option>
+                        <option value="ar-SA">Arabic</option>
+                        <option value="zh-CN">Chinese (Mandarin)</option>
+                        <option value="pt-BR">Portuguese (Brazil)</option>
+                    </select>
+                    <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-slate-500">
+                        <i class="fa-solid fa-chevron-down text-xs"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Browser Support Alert (Hidden by default) -->
+    <div id="supportWarning" class="hidden max-w-5xl mx-auto w-full px-4 pt-4">
+        <div class="bg-amber-50 border border-amber-200 text-amber-800 px-4 py-3 rounded-xl flex items-center justify-between text-sm shadow-sm"
+            role="alert">
+            <div class="flex items-center space-x-3">
+                <i class="fa-solid fa-triangle-exclamation text-amber-500 text-lg"></i>
+                <span><strong>Browser Warning:</strong> Web Speech API is not supported in this browser. Please use
+                    <strong>Google Chrome</strong>, <strong>Microsoft Edge</strong>, or <strong>Safari</strong> for full
+                    speech-to-text functionality.</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <main class="max-w-5xl mx-auto w-full px-4 sm:px-6 py-6 flex-grow flex flex-col space-y-4">
+
+        <!-- Controls Bar -->
+        <div
+            class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-wrap gap-3 items-center justify-between">
+
+            <!-- Primary Controls (Start / Pause) -->
+            <div class="flex items-center space-x-3 w-full sm:w-auto">
+                <button id="toggleBtn" onclick="toggleRecognition()"
+                    class="flex-1 sm:flex-initial inline-flex items-center justify-center space-x-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-semibold px-6 py-3 rounded-xl shadow-md shadow-indigo-100 transition-all focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2">
+                    <i id="toggleIcon" class="fa-solid fa-microphone text-base"></i>
+                    <span id="toggleText">Start Listening</span>
+                </button>
+
+                <button id="clearBtn" onclick="clearText()"
+                    class="inline-flex items-center justify-center p-3 text-slate-600 hover:text-rose-600 bg-slate-100 hover:bg-rose-50 rounded-xl transition border border-transparent hover:border-rose-200 focus:outline-none"
+                    title="Clear All Text">
+                    <i class="fa-solid fa-trash-can text-base"></i>
+                </button>
+            </div>
+
+            <!-- Action Buttons (Copy / Download) -->
+            <div class="flex items-center space-x-2 w-full sm:w-auto justify-end">
+                <button id="copyBtn" onclick="copyText()"
+                    class="flex-1 sm:flex-initial inline-flex items-center justify-center space-x-2 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 font-medium px-4 py-2.5 rounded-xl border border-slate-200 transition focus:outline-none">
+                    <i class="fa-solid fa-copy text-slate-500"></i>
+                    <span>Copy</span>
+                </button>
+
+                <button id="downloadBtn" onclick="downloadText()"
+                    class="flex-1 sm:flex-initial inline-flex items-center justify-center space-x-2 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 font-medium px-4 py-2.5 rounded-xl border border-slate-200 transition focus:outline-none">
+                    <i class="fa-solid fa-download text-slate-500"></i>
+                    <span>Download .txt</span>
+                </button>
+            </div>
+
+        </div>
+
+        <!-- Status Bar -->
+        <div class="flex items-center justify-between px-2 text-xs text-slate-500 font-medium">
+            <div class="flex items-center space-x-2">
+                <span id="statusIndicator" class="w-2.5 h-2.5 rounded-full bg-slate-400"></span>
+                <span id="statusText">Status: Idle</span>
+            </div>
+            <div class="flex items-center space-x-4">
+                <span>Words: <strong id="wordCount" class="text-slate-800">0</strong></span>
+                <span>Characters: <strong id="charCount" class="text-slate-800">0</strong></span>
+            </div>
+        </div>
+
+        <!-- Transcript Box Container -->
+        <div
+            class="relative flex-grow flex flex-col bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden min-h-[320px]">
+
+            <!-- Textarea for Transcript -->
+            <textarea id="transcript"
+                placeholder="Click 'Start Listening' and begin speaking, or type directly into this editor..."
+                class="w-full h-full p-6 text-slate-800 text-base sm:text-lg leading-relaxed resize-none focus:outline-none font-normal placeholder-slate-400"
+                oninput="updateCounts()"></textarea>
+
+            <!-- Visual Wave/Status Overlay (Appears during recording) -->
+            <div id="recordingBadge"
+                class="hidden absolute top-4 right-4 bg-indigo-50 border border-indigo-100 text-indigo-700 px-3 py-1.5 rounded-full flex items-center space-x-2 text-xs font-semibold shadow-xs">
+                <span class="w-2 h-2 rounded-full bg-indigo-600 animate-recording"></span>
+                <span>Live Transcribing</span>
+            </div>
+
+        </div>
+
+    </main>
+
+    <!-- Notification Toast -->
+    <div id="toast"
+        class="fixed bottom-6 right-6 transform translate-y-20 opacity-0 bg-slate-900 text-white text-sm font-medium px-5 py-3 rounded-xl shadow-xl flex items-center space-x-3 transition-all duration-300 z-50 pointer-events-none">
+        <i id="toastIcon" class="fa-solid fa-circle-check text-emerald-400 text-base"></i>
+        <span id="toastMessage">Action successful!</span>
+    </div>
+
+    <!-- Footer -->
+    <footer class="bg-white border-t border-slate-200 py-4 text-center text-xs text-slate-400">
+        <p>Powered by Web Speech API • Works best in modern Chrome & Edge browsers</p>
+    </footer>
+
+    <!-- App Script -->
+    <script>
+        // State Variables
+        let recognition = null;
+        let isListening = false;
+        let finalTranscript = '';
+
+        // DOM Elements
+        const transcriptEl = document.getElementById('transcript');
+        const toggleBtn = document.getElementById('toggleBtn');
+        const toggleIcon = document.getElementById('toggleIcon');
+        const toggleText = document.getElementById('toggleText');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const statusText = document.getElementById('statusText');
+        const wordCountEl = document.getElementById('wordCount');
+        const charCountEl = document.getElementById('charCount');
+        const languageSelect = document.getElementById('languageSelect');
+        const recordingBadge = document.getElementById('recordingBadge');
+        const supportWarning = document.getElementById('supportWarning');
+        const toast = document.getElementById('toast');
+        const toastMessage = document.getElementById('toastMessage');
+        const toastIcon = document.getElementById('toastIcon');
+
+        // Initialize Web Speech API
+        window.onload = function () {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+            if (!SpeechRecognition) {
+                supportWarning.classList.remove('hidden');
+                toggleBtn.disabled = true;
+                toggleBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                return;
+            }
+
+            recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = languageSelect.value;
+
+            // Speech Recognition Events
+            recognition.onstart = function () {
+                isListening = true;
+                updateUIState(true);
+            };
+
+            recognition.onerror = function (event) {
+                console.error("Speech recognition error:", event.error);
+                if (event.error === 'not-allowed') {
+                    showToast('Microphone access denied!', 'error');
+                } else if (event.error === 'no-speech') {
+                    // Silent continue, no-op
+                } else {
+                    showToast(`Speech error: ${event.error}`, 'error');
+                }
+            };
+
+            recognition.onend = function () {
+                // If user didn't explicitly pause, restart recognition to maintain continuous mode
+                if (isListening) {
+                    try {
+                        recognition.start();
+                    } catch (e) {
+                        isListening = false;
+                        updateUIState(false);
+                    }
+                } else {
+                    updateUIState(false);
+                }
+            };
+
+            recognition.onresult = function (event) {
+                let interimTranscript = '';
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        finalTranscript += event.results[i][0].transcript + ' ';
+                    } else {
+                        interimTranscript += event.results[i][0].transcript;
+                    }
+                }
+
+                // Render both final and interim results inside the textarea
+                transcriptEl.value = finalTranscript + interimTranscript;
+                updateCounts();
+
+                // Auto scroll to bottom of textarea
+                transcriptEl.scrollTop = transcriptEl.scrollHeight;
+            };
+
+            // Handle Manual Editing syncing
+            transcriptEl.addEventListener('input', function () {
+                finalTranscript = transcriptEl.value;
+                updateCounts();
+            });
+
+            // Handle Language Selector Change
+            languageSelect.addEventListener('change', function () {
+                if (recognition) {
+                    recognition.lang = this.value;
+                    if (isListening) {
+                        recognition.stop();
+                        // will auto-restart via onend
+                    }
+                    showToast(`Language changed to ${languageSelect.options[languageSelect.selectedIndex].text}`);
+                }
+            });
+
+            updateCounts();
+        };
+
+        // Toggle Listening Function
+        function toggleRecognition() {
+            if (!recognition) return;
+
+            if (isListening) {
+                isListening = false;
+                recognition.stop();
+                showToast('Transcription paused');
+            } else {
+                // Sync finalTranscript with current textarea value before starting
+                finalTranscript = transcriptEl.value;
+                if (finalTranscript && !finalTranscript.endsWith(' ')) {
+                    finalTranscript += ' ';
+                }
+
+                try {
+                    recognition.lang = languageSelect.value;
+                    recognition.start();
+                    showToast('Listening started...');
+                } catch (err) {
+                    console.error(err);
+                }
+            }
+        }
+
+        // UI State Updater
+        function updateUIState(active) {
+            if (active) {
+                toggleBtn.className = "flex-1 sm:flex-initial inline-flex items-center justify-center space-x-2 bg-rose-600 hover:bg-rose-700 active:bg-rose-800 text-white font-semibold px-6 py-3 rounded-xl shadow-md shadow-rose-100 transition-all focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-2";
+                toggleIcon.className = "fa-solid fa-pause text-base";
+                toggleText.textContent = "Pause Listening";
+
+                statusIndicator.className = "w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse";
+                statusText.textContent = "Status: Listening...";
+                recordingBadge.classList.remove('hidden');
+            } else {
+                toggleBtn.className = "flex-1 sm:flex-initial inline-flex items-center justify-center space-x-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-semibold px-6 py-3 rounded-xl shadow-md shadow-indigo-100 transition-all focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2";
+                toggleIcon.className = "fa-solid fa-microphone text-base";
+                toggleText.textContent = "Start Listening";
+
+                statusIndicator.className = "w-2.5 h-2.5 rounded-full bg-slate-400";
+                statusText.textContent = "Status: Paused";
+                recordingBadge.classList.add('hidden');
+            }
+        }
+
+        // Live Word & Character Count Calculation
+        function updateCounts() {
+            const text = transcriptEl.value.trim();
+            const words = text ? text.split(/\s+/).filter(word => word.length > 0).length : 0;
+            const chars = transcriptEl.value.length;
+
+            wordCountEl.textContent = words.toLocaleString();
+            charCountEl.textContent = chars.toLocaleString();
+        }
+
+        // Clear Text Action
+        function clearText() {
+            if (!transcriptEl.value) return;
+
+            transcriptEl.value = '';
+            finalTranscript = '';
+            updateCounts();
+            showToast('Transcript cleared');
+        }
+
+        // Copy to Clipboard Action
+        function copyText() {
+            const text = transcriptEl.value;
+            if (!text) {
+                showToast('Nothing to copy!', 'error');
+                return;
+            }
+
+            // Safe clipboard execution using standard DOM selection / execCommand fallback
+            transcriptEl.select();
+            try {
+                const successful = document.execCommand('copy');
+                if (successful) {
+                    showToast('Copied to clipboard!');
+                } else {
+                    showToast('Failed to copy', 'error');
+                }
+            } catch (err) {
+                showToast('Copy failed: ' + err, 'error');
+            }
+
+            // Unselect text
+            window.getSelection().removeAllRanges();
+        }
+
+        // Download Text Action
+        function downloadText() {
+            const text = transcriptEl.value;
+            if (!text) {
+                showToast('Nothing to download!', 'error');
+                return;
+            }
+
+            const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+
+            const date = new Date().toISOString().slice(0, 10);
+            link.href = url;
+            link.download = `transcript_${date}.txt`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            showToast('Downloaded .txt file!');
+        }
+
+        // Toast Notification helper
+        let toastTimeout;
+        function showToast(message, type = 'success') {
+            clearTimeout(toastTimeout);
+            toastMessage.textContent = message;
+
+            if (type === 'error') {
+                toastIcon.className = "fa-solid fa-circle-xmark text-rose-400 text-base";
+            } else {
+                toastIcon.className = "fa-solid fa-circle-check text-emerald-400 text-base";
+            }
+
+            toast.classList.remove('translate-y-20', 'opacity-0');
+            toast.classList.add('translate-y-0', 'opacity-100');
+
+            toastTimeout = setTimeout(() => {
+                toast.classList.remove('translate-y-0', 'opacity-100');
+                toast.classList.add('translate-y-20', 'opacity-0');
+            }, 3000);
+        }
+    </script>
+</body>
+
+</html>
