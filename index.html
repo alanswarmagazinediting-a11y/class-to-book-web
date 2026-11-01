@@ -54,7 +54,7 @@
   <div id="unsupportedAlert" class="hidden bg-rose-500 text-white px-4 py-3 text-center text-sm font-medium shadow-md">
     <div class="max-w-4xl mx-auto flex items-center justify-center gap-2">
       <i data-lucide="alert-triangle" class="w-5 h-5 flex-shrink-0"></i>
-      <span>Web Speech API is not supported in this browser. Please use <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong> for real-time speech recognition.</span>
+      <span>This browser cannot run the on-device Whisper engine. Please use <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong> (recent version) so the model can run locally on your device.</span>
     </div>
   </div>
 
@@ -178,6 +178,59 @@
 
     </div>
 
+    <!-- On-Device Whisper Engine Card (no API key, no credits, no server) -->
+    <div class="bg-white dark:bg-slate-900 rounded-2xl p-4 sm:p-5 border border-slate-200/80 dark:border-slate-800/80 shadow-sm shadow-slate-200/50 dark:shadow-none flex flex-col gap-4">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div class="flex items-center gap-2.5">
+          <div class="w-10 h-10 rounded-2xl bg-gradient-to-tr from-emerald-600 to-teal-500 flex items-center justify-center text-white shadow-md shadow-emerald-500/20">
+            <i data-lucide="cpu" class="w-5 h-5"></i>
+          </div>
+          <div>
+            <h2 class="text-sm font-bold text-slate-900 dark:text-slate-100">On-Device Whisper Engine</h2>
+            <p class="text-[11px] text-slate-500 dark:text-slate-400">Runs fully inside your browser — no API key, no credits, no upload.</p>
+          </div>
+        </div>
+        <button id="loadModelBtn" class="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 dark:bg-indigo-600 dark:hover:bg-indigo-500 active:scale-95 transition-all shadow-sm disabled:opacity-40 disabled:cursor-not-allowed">
+          <i data-lucide="download-cloud" class="w-3.5 h-3.5"></i>
+          <span id="loadModelBtnText">Load Model</span>
+        </button>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <label class="flex flex-col gap-1">
+          <span class="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">Model</span>
+          <select id="modelSelect" class="w-full px-3 py-2 rounded-xl text-xs font-medium bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
+            <option value="tiny">Whisper Tiny · ~40 MB · fastest</option>
+            <option value="base" selected>Whisper Base · ~80 MB · balanced</option>
+            <option value="small">Whisper Small · ~250 MB · better Malayalam &amp; Arabic</option>
+            <option value="turbo">Whisper Large v3 Turbo · ~800 MB · best (WebGPU)</option>
+          </select>
+        </label>
+        <label class="flex flex-col gap-1">
+          <span class="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">Compute Backend</span>
+          <select id="deviceSelect" class="w-full px-3 py-2 rounded-xl text-xs font-medium bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
+            <option value="auto" selected>Auto (WebGPU when available)</option>
+            <option value="wasm">WebAssembly (CPU)</option>
+            <option value="webgpu">WebGPU (GPU accelerated)</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="flex flex-col gap-2">
+        <div class="flex items-center justify-between text-[11px] font-mono">
+          <span id="modelStatus" class="text-slate-500 dark:text-slate-400">Model not loaded yet.</span>
+          <span id="modelPct" class="text-slate-500 dark:text-slate-400">0%</span>
+        </div>
+        <div class="h-2 w-full bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+          <div id="modelBar" class="h-full w-0 bg-gradient-to-r from-indigo-500 to-emerald-500 transition-all duration-200"></div>
+        </div>
+      </div>
+
+      <p class="text-[11px] text-slate-400 dark:text-slate-500 leading-relaxed">
+        The first run downloads the model from the Hugging Face CDN and caches it in your browser. Larger models are more accurate but slower. Your audio is never uploaded anywhere.
+      </p>
+    </div>
+
     <!-- Text Editor Section -->
     <div class="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200/80 dark:border-slate-800/80 shadow-sm shadow-slate-200/50 dark:shadow-none flex flex-col overflow-hidden">
       
@@ -292,15 +345,15 @@
           <div id="dbgMicPerm" class="font-bold text-slate-200 text-xs mt-0.5">Checking...</div>
         </div>
         <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
-          <div class="text-slate-400 text-[10px] uppercase">Recognition Started (onstart)</div>
-          <div id="dbgStarted" class="font-bold text-slate-400 text-xs mt-0.5">No</div>
+          <div class="text-slate-400 text-[10px] uppercase">Engine Status</div>
+          <div id="dbgStarted" class="font-bold text-slate-400 text-xs mt-0.5">Idle</div>
         </div>
         <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
-          <div class="text-slate-400 text-[10px] uppercase">Audio Captured (onaudiostart)</div>
+          <div class="text-slate-400 text-[10px] uppercase">Audio Captured</div>
           <div id="dbgAudio" class="font-bold text-slate-400 text-xs mt-0.5">No</div>
         </div>
         <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
-          <div class="text-slate-400 text-[10px] uppercase">Speech Detected (onspeechstart)</div>
+          <div class="text-slate-400 text-[10px] uppercase">Speech Detected (VAD)</div>
           <div id="dbgSpeech" class="font-bold text-slate-400 text-xs mt-0.5">No</div>
         </div>
         <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
@@ -311,11 +364,11 @@
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
         <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
-          <div class="text-slate-400 text-[10px] uppercase">Recognition Result Received (onresult)</div>
-          <div id="dbgResult" class="font-semibold text-emerald-400 text-xs mt-0.5 truncate">0 results received</div>
+          <div class="text-slate-400 text-[10px] uppercase">Segments Transcribed</div>
+          <div id="dbgResult" class="font-semibold text-emerald-400 text-xs mt-0.5 truncate">0 segments transcribed</div>
         </div>
         <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
-          <div class="text-slate-400 text-[10px] uppercase">Last Error / Notice (onerror)</div>
+          <div class="text-slate-400 text-[10px] uppercase">Last Error / Notice</div>
           <div id="dbgError" class="font-semibold text-slate-400 text-xs mt-0.5 truncate">None</div>
         </div>
       </div>
@@ -325,7 +378,7 @@
     <div class="p-4 rounded-xl bg-indigo-50/70 dark:bg-indigo-950/30 border border-indigo-100 dark:border-indigo-900/50 flex items-start gap-3 text-xs text-indigo-900 dark:text-indigo-200">
       <i data-lucide="shield-check" class="w-5 h-5 text-indigo-600 dark:text-indigo-400 flex-shrink-0 mt-0.5"></i>
       <p class="leading-relaxed">
-        <strong>Privacy Notice:</strong> When the multilingual server engine is active, short recordings of your speech are sent to the transcription service to identify the language and produce text. Your API key is kept on the server only. No audio is stored by this application.
+        <strong>Privacy Notice:</strong> All speech recognition runs entirely on your own device using the open-source Whisper model (WebAssembly / WebGPU). Your audio is never uploaded to any server and is never stored. No API key, account or paid service is used. The only network activity is a one-time download of the model files, which your browser then caches.
       </p>
     </div>
 

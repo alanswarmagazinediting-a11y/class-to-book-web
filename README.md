@@ -39,7 +39,7 @@ The result-handling logic uses a clean **Session Memory Model**:
   - **Download TXT:** Instant download as a clean timestamped `.txt` document.
   - **Select All:** One-click selection of the full transcript.
   - **Clear Text:** Safely clears the editor after user confirmation.
-- **Diagnostic Debug Panel:** Real-time visibility into Web Speech API events (`onstart`, `onaudiostart`, `onspeechstart`, `onresult`, `onerror`).
+- **Diagnostic Debug Panel:** Real-time visibility into the on-device engine (browser support, microphone permission, engine status, audio capture, VAD speech detection, detected language, transcribed segments, last error).
 - **Timer:** Real-time speaking duration in `MM:SS`.
 - **Theme:** Professional light theme by default with a dark mode toggle (`localStorage` persisted).
 

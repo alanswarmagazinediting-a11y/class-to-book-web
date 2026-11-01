@@ -1,34 +1,61 @@
 /**
  * VoiceType – Live Multilingual Speech to Text
  *
- * DUAL-ENGINE ARCHITECTURE
+ * ON-DEVICE WHISPER ENGINE
  * ---------------------------------------------------------------------------
- * 1. SERVER ENGINE (primary)  – records audio with MediaRecorder, splits it at
- *    natural silences into disjoint phrase chunks, and posts each chunk to
- *    /api/transcribe (Whisper via Groq or OpenAI). Whisper identifies the
- *    language FROM THE AUDIO and returns text in the original writing system
- *    (Malayalam / Arabic / English). API key stays server-side.
+ * Speech recognition runs ENTIRELY inside the browser:
  *
- * 2. BROWSER ENGINE (fallback) – the Web Speech API, used only when the server
- *    engine is not configured/reachable. It is append-only: it processes only
- *    new results via event.resultIndex and never rebuilds the transcript.
+ *   microphone ─► AudioContext (16 kHz mono PCM)
+ *                      │
+ *                      ├─ adaptive voice-activity detection (VAD)
+ *                      │
+ *                      └─ disjoint phrase chunk, cut on real silence
+ *                               │
+ *                               ▼
+ *                   Web Worker + transformers.js
+ *                   (open-source Whisper ONNX via WebGPU / WebAssembly)
+ *                               │
+ *                               ▼
+ *                   text in the ORIGINAL writing system
+ *                   (Malayalam / العربية / English)
  *
- * DUPLICATE PREVENTION
+ * There is no server, no API key, no credits and no upload: the audio never
+ * leaves the device. The only network activity is downloading the model files
+ * once from the public Hugging Face CDN (then they are cached by the browser).
+ *
+ * WHY WORDS ARE NEVER DUPLICATED
  * ---------------------------------------------------------------------------
- * - Audio chunks are DISJOINT (the recorder is restarted after every phrase),
- *   so the same audio is never transcribed twice.
- * - Every recognized segment gets a unique id and is committed exactly once
- *   (guarded by `committedSegmentIds`).
- * - The transcript is append-only (`finalTranscript += ...`); it is never
- *   reconstructed from a cumulative result list.
- * - Genuine repetitions are preserved: there is NO text-based de-duplication.
+ * - Audio chunks are DISJOINT. A chunk is closed at a real pause, and the very
+ *   next sample starts the following chunk, so no audio is ever fed twice.
+ * - Every chunk carries a unique id and is committed EXACTLY ONCE (the
+ *   `committedSegmentIds` guard drops any repeat).
+ * - The transcript is append-only and is never rebuilt from a cumulative
+ *   result list.
+ * - There is NO text-based duplicate filter, so genuine repetitions that the
+ *   speaker really said are preserved.
+ *
+ * CONFIRMED vs TEMPORARY
+ * ---------------------------------------------------------------------------
+ * Confirmed text lives in the editable textarea. Text that is still being
+ * decoded is streamed into the separate `interimStream` panel and is never
+ * mixed into the editor.
  */
 
 // -------------------------------------------------------------
 // 0. Configuration
 // -------------------------------------------------------------
 
-const SERVER_ASR_ENDPOINT = '/api/transcribe';
+// Transformer.js build used for on-device inference (open source, MIT).
+const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+
+// Open-source Whisper models, converted to ONNX and published on the
+// Hugging Face Hub. Nothing here requires a key, an account or credits.
+const MODEL_REGISTRY = {
+  tiny:  { id: 'onnx-community/whisper-tiny',             label: 'Whisper Tiny' },
+  base:  { id: 'onnx-community/whisper-base',             label: 'Whisper Base' },
+  small: { id: 'onnx-community/whisper-small',            label: 'Whisper Small' },
+  turbo: { id: 'onnx-community/whisper-large-v3-turbo',   label: 'Whisper Large v3 Turbo' }
+};
 
 // Supported Languages
 const LANG_CONFIG = {
@@ -37,41 +64,242 @@ const LANG_CONFIG = {
   ENGLISH:   { code: 'en-US', short: 'en', name: 'English',   badge: 'Tertiary', script: 'English' }
 };
 
+// Script ranges used to label the language of a decoded phrase.
 const SCRIPT_PATTERNS = {
   malayalam: /[\u0D00-\u0D7F]/,
   arabic:    /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/,
   english:   /[a-zA-Z]/
 };
 
-// Voice-activity-detection tuning for the server engine.
-// The speech gate is ADAPTIVE — it is derived from the measured room noise, so
-// a quiet microphone still registers speech instead of staying silent.
-const VAD = {
-  INTERVAL_MS: 60,           // how often the mic level is sampled
-  CALIBRATION_MS: 800,       // listen to room noise before gating
-  MIN_GATE: 0.006,           // most sensitive gate we will ever use
-  NOISE_MULTIPLIER: 2.2,     // gate = max(MIN_GATE, noiseFloor * this)
-  SILENCE_FLUSH_MS: 850,     // pause length that closes a phrase
-  MIN_CHUNK_MS: 700,         // ignore blips shorter than this
-  PERIODIC_FLUSH_MS: 4000,   // never sit on continuous speech longer than this
-  MAX_CHUNK_MS: 15000        // hard cap; silent leftovers are discarded
+// Audio capture + voice-activity-detection tuning.
+// The speech gate is ADAPTIVE: it is derived from the measured room noise, so a
+// quiet microphone still registers speech instead of staying silent.
+const AUDIO = {
+  SAMPLE_RATE: 16000,        // Whisper only accepts 16 kHz mono
+  FRAME_MS: 20,              // VAD resolution
+  PROCESSOR_BUFFER: 1024,    // ScriptProcessor window (~64 ms @16 kHz)
+  CALIBRATION_MS: 600,       // listen to the room before latching the gate
+  MIN_GATE: 0.0045,          // most sensitive gate we will ever use
+  NOISE_MULTIPLIER: 2.6,     // gate = max(MIN_GATE, noiseFloor * this)
+  MIN_SPEECH_MS: 160,        // voiced audio needed before a chunk opens
+  SILENCE_CLOSE_MS: 700,     // pause length that closes a phrase
+  TAIL_KEEP_MS: 180,         // silence kept at the end so no word is clipped
+  MIN_CHUNK_MS: 500,         // ignore blips shorter than this
+  MAX_CHUNK_MS: 14000,       // hard cap; Whisper's window is 30 s
+  PREROLL_MS: 320            // audio kept before speech onset
 };
+
+const FRAME_SIZE = Math.round((AUDIO.SAMPLE_RATE * AUDIO.FRAME_MS) / 1000);
+const PREROLL_FRAMES = Math.round(AUDIO.PREROLL_MS / AUDIO.FRAME_MS);
+const CALIBRATION_FRAMES = Math.round(AUDIO.CALIBRATION_MS / AUDIO.FRAME_MS);
+
+// RTL embedding marks so Arabic segments render right-to-left in a plain textarea
+const RLE = '\u202B';
+const PDF = '\u202C';
+
+// -------------------------------------------------------------
+// 0b. ASR worker source (runs off the main thread)
+// -------------------------------------------------------------
+
+const ASR_WORKER_SOURCE = [
+  "'use strict';",
+  "",
+  "const CDN_URLS = [",
+  "  " + JSON.stringify(TRANSFORMERS_CDN) + ",",
+  "  " + JSON.stringify(TRANSFORMERS_CDN + "/dist/transformers.js"),
+  "];",
+  "",
+  "let libPromise = null;",
+  "",
+  "function loadLibrary() {",
+  "  if (!libPromise) {",
+  "    libPromise = (async function () {",
+  "      let lastError = null;",
+  "      for (let i = 0; i < CDN_URLS.length; i++) {",
+  "        try {",
+  "          const mod = await import(CDN_URLS[i]);",
+  "          if (mod && typeof mod.pipeline === 'function') return mod;",
+  "          lastError = new Error('transformers.js export missing at ' + CDN_URLS[i]);",
+  "        } catch (err) {",
+  "          lastError = err;",
+  "        }",
+  "      }",
+  "      throw lastError || new Error('Could not load the inference library.');",
+  "    })();",
+  "  }",
+  "  return libPromise;",
+  "}",
+  "",
+  "let transcriber = null;",
+  "let chain = Promise.resolve();",
+  "",
+  "function emit(message) { self.postMessage(message); }",
+  "function errText(err) { return (err && err.message) ? err.message : String(err); }",
+  "",
+  "// Whisper's own language-detection step. transformers.js does NOT do this for",
+  "// us: when no language is given it silently falls back to English (see its",
+  "// `_retrieve_init_tokens`). We therefore read the decoder logits that follow",
+  "// <|startoftranscript|> ourselves and pick the most likely language token.",
+  "// Candidates are limited to the three languages this app supports so the",
+  "// output is always written in one of the expected native scripts.",
+  "const TARGET_LANG_TOKENS = ['<|en|>', '<|ml|>', '<|ar|>'];",
+  "",
+  "async function detectLanguage(audio) {",
+  "  const mod = await loadLibrary();",
+  "  const model = transcriber && transcriber.model;",
+  "  const gc = model && model.generation_config;",
+  "  if (!gc || !gc.lang_to_id || gc.decoder_start_token_id == null) return null;",
+  "",
+  "  const candidates = [];",
+  "  for (let i = 0; i < TARGET_LANG_TOKENS.length; i++) {",
+  "    const token = TARGET_LANG_TOKENS[i];",
+  "    const id = gc.lang_to_id[token];",
+  "    if (typeof id === 'number') candidates.push({ code: token.slice(2, -2), id: id });",
+  "  }",
+  "  if (candidates.length === 0) return null;",
+  "",
+  "  // One encoder pass plus a single decoder step is all Whisper needs to",
+  "  // decide the language.",
+  "  const feature = await transcriber.processor(audio);",
+  "  const start = gc.decoder_start_token_id;",
+  "  const decoder_input_ids = new mod.Tensor('int64', BigInt64Array.from([BigInt(start)]), [1, 1]);",
+  "  const out = await model.forward({",
+  "    input_features: feature.input_features,",
+  "    decoder_input_ids: decoder_input_ids",
+  "  });",
+  "",
+  "  const logits = out && out.logits;",
+  "  if (!logits || !logits.data || !logits.dims) return null;",
+  "",
+  "  const vocab = logits.dims[logits.dims.length - 1];",
+  "  const base = logits.data.length - vocab;",
+  "  let best = -Infinity;",
+  "  let bestCode = null;",
+  "  for (let i = 0; i < candidates.length; i++) {",
+  "    const value = logits.data[base + candidates[i].id];",
+  "    if (typeof value === 'number' && value > best) {",
+  "      best = value;",
+  "      bestCode = candidates[i].code;",
+  "    }",
+  "  }",
+  "  return bestCode;",
+  "}",
+  "",
+  "self.addEventListener('message', function (event) {",
+  "  const data = event.data || {};",
+  "  if (data.type === 'load') chain = chain.then(function () { return doLoad(data); }, function () { return doLoad(data); });",
+  "  else if (data.type === 'transcribe') chain = chain.then(function () { return doTranscribe(data); }, function () { return doTranscribe(data); });",
+  "});",
+  "",
+  "async function doLoad(data) {",
+  "  try {",
+  "    const mod = await loadLibrary();",
+  "    const env = mod.env;",
+  "    env.allowLocalModels = false;",
+  "    env.useBrowserCache = true;",
+  "",
+  "    const order = data.device === 'wasm' ? ['wasm']",
+  "                : data.device === 'webgpu' ? ['webgpu', 'wasm']",
+  "                : ['webgpu', 'wasm'];",
+  "",
+  "    let lastError = null;",
+  "    for (let i = 0; i < order.length; i++) {",
+  "      const device = order[i];",
+  "      // Whisper is very sensitive to encoder quantisation, so the encoder is",
+  "      // kept at half precision on the GPU and 8-bit on the CPU.",
+  "      const dtype = device === 'webgpu'",
+  "        ? { encoder_model: 'fp16', decoder_model_merged: 'fp16' }",
+  "        : 'q8';",
+  "      try {",
+  "        emit({ type: 'status', message: 'Loading weights on ' + device + '…' });",
+  "        transcriber = await mod.pipeline('automatic-speech-recognition', data.model, {",
+  "          device: device,",
+  "          dtype: dtype,",
+  "          progress_callback: function (p) { emit({ type: 'progress', payload: p }); }",
+  "        });",
+  "        lastError = null;",
+  "        break;",
+  "      } catch (err) {",
+  "        lastError = err;",
+  "        transcriber = null;",
+  "        emit({ type: 'status', message: 'Backend ' + device + ' unavailable — trying the next one…' });",
+  "      }",
+  "    }",
+  "",
+  "    if (!transcriber) throw (lastError || new Error('The model could not be loaded.'));",
+  "    emit({ type: 'loaded', device: transcriber.model && transcriber.model.device ? transcriber.model.device : order[0] });",
+  "  } catch (err) {",
+  "    emit({ type: 'error', scope: 'load', message: errText(err) });",
+  "  }",
+  "}",
+  "",
+  "async function doTranscribe(data) {",
+  "  if (!transcriber) {",
+  "    emit({ type: 'error', scope: 'transcribe', id: data.id, message: 'The model is not loaded yet.' });",
+  "    return;",
+  "  }",
+  "",
+  "  try {",
+  "    // Manual language hint wins; otherwise let Whisper identify the language",
+  "    // of this chunk so mixed-language speech is handled chunk by chunk.",
+  "    let language = data.language || null;",
+  "    if (!language) {",
+  "      try {",
+  "        language = await detectLanguage(data.audio);",
+  "      } catch (detectError) {",
+  "        language = null;",
+  "      }",
+  "    }",
+  "",
+  "    const options = { task: 'transcribe' };",
+  "    if (language) options.language = language;",
+  "",
+  "    // Stream decoded tokens so the UI can show a temporary transcript.",
+  "    try {",
+  "      const mod = await loadLibrary();",
+  "      if (mod.TextStreamer && transcriber.tokenizer) {",
+  "        let acc = '';",
+  "        options.streamer = new mod.TextStreamer(transcriber.tokenizer, {",
+  "          skip_prompt: true,",
+  "          skip_special_tokens: true,",
+  "          callback_function: function (token) {",
+  "            acc += token;",
+  "            emit({ type: 'partial', id: data.id, text: acc });",
+  "          }",
+  "        });",
+  "      }",
+  "    } catch (streamError) {",
+  "      delete options.streamer;",
+  "    }",
+  "",
+  "    let output = null;",
+  "    try {",
+  "      output = await transcriber(data.audio, options);",
+  "    } catch (firstError) {",
+  "      if (!options.streamer) throw firstError;",
+  "      // Retry once without streaming — a streamer problem must not lose audio.",
+  "      delete options.streamer;",
+  "      output = await transcriber(data.audio, options);",
+  "    }",
+  "",
+  "    emit({ type: 'result', id: data.id, language: language, text: (output && output.text) ? output.text : '' });",
+  "  } catch (err) {",
+  "    emit({ type: 'error', scope: 'transcribe', id: data.id, message: errText(err) });",
+  "  }",
+  "}",
+  ""
+].join('\n');
 
 // -------------------------------------------------------------
 // 1. Application State
 // -------------------------------------------------------------
-
-let recognition = null;          // Web Speech instance (browser engine)
-let engineMode = 'browser';      // 'server' | 'browser'  (active engine)
-let serverConfigured = null;     // null = probing, true/false = known
-let serverProvider = '';         // 'groq' | 'openai' when known
 
 let appState = 'idle';           // 'idle' | 'recording' | 'paused' | 'stopped'
 let activeMode = 'auto';         // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
 let currentLangCode = 'ml-IN';
 let detectedLang = LANG_CONFIG.MALAYALAM;
 
-// Append-only transcript model (single source of truth for the editor)
+// Append-only transcript model (the editor is the single source of truth)
 let finalTranscript = '';
 
 // Segment store — each committed segment is recorded once, by unique id.
@@ -79,37 +307,45 @@ let segmentCounter = 0;
 const committedSegmentIds = new Set();
 const committedSegments = [];    // { id, lang, text }
 
-let isIntentionalStop = false;
-let isRestarting = false;
-let rapidRestartCount = 0;
-let lastEndAt = 0;
-let resultCount = 0;
-let consecutiveEnglishTokens = 0;
+// Bumped by "Clear Text" so in-flight decodes cannot repopulate a cleared editor.
+let transcriptGeneration = 0;
 
-// Server-engine runtime handles
+// On-device engine state
+let asrWorker = null;
+let modelReady = false;
+let modelLoading = false;
+let pendingModelKey = null;
+let loadedModelKey = null;
+let loadedDeviceLabel = '';
+let modelLoadResolve = null;
+let pendingModelLoad = null;
+const modelFileProgress = new Map();
+
+// Transcription queue (one decode at a time, in capture order)
+const transcriptionQueue = [];
+let activeJob = null;
+let partialText = '';
+let segmentsDone = 0;
+let segmentsQueued = 0;
+
+// Microphone / audio graph
 let micStream = null;
 let audioContext = null;
-let analyser = null;
-let vadBuffer = null;
-let vadTimer = null;
-let chunkRecorder = null;
-let chunkParts = [];
-let chunkStartedAt = 0;
-let lastVoiceAt = 0;
-let sawSpeechInChunk = false;
-let peakRms = 0;                 // loudest sample seen in the current chunk
-let discardNextChunk = false;    // true => chunk holds only silence, never sent
-let noiseFloor = null;           // measured room noise (null until calibrated)
-let noiseSamples = [];
-let vadCalibrationAt = 0;
-let lastLevelUiAt = 0;
-let pendingTranscriptions = 0;
-let serverFailures = 0;
-let flushInFlight = false;
+let sourceNode = null;
+let processorNode = null;
+let muteNode = null;
+let captureSampleRate = AUDIO.SAMPLE_RATE;
 
-// RTL embedding marks so Arabic segments render right-to-left in a plain textarea
-const RLE = '\u202B';
-const PDF = '\u202C';
+// VAD + chunk assembly
+let noiseFloor = null;
+let noiseSamples = [];
+let prerollFrames = [];
+let chunkFrames = [];
+let speechActive = false;
+let onsetMs = 0;
+let silenceMs = 0;
+let leftover = new Float32Array(0);
+let lastLevelUiAt = 0;
 
 // Timer State
 let timerInterval = null;
@@ -157,6 +393,15 @@ const toastMsg = document.getElementById('toastMsg');
 const toastIcon = document.getElementById('toastIcon');
 const unsupportedAlert = document.getElementById('unsupportedAlert');
 
+// On-device engine card
+const loadModelBtn = document.getElementById('loadModelBtn');
+const loadModelBtnText = document.getElementById('loadModelBtnText');
+const modelSelect = document.getElementById('modelSelect');
+const deviceSelect = document.getElementById('deviceSelect');
+const modelStatus = document.getElementById('modelStatus');
+const modelPct = document.getElementById('modelPct');
+const modelBar = document.getElementById('modelBar');
+
 // Diagnostic elements
 const dbgSupported = document.getElementById('dbgSupported');
 const dbgMicPerm = document.getElementById('dbgMicPerm');
@@ -174,6 +419,7 @@ const dbgError = document.getElementById('dbgError');
 let toastTimeout = null;
 
 function showToast(message, type = 'success') {
+  if (!toast || !toastMsg || !toastIcon) return;
   if (toastTimeout) clearTimeout(toastTimeout);
 
   toastMsg.textContent = message;
@@ -191,14 +437,14 @@ function showToast(message, type = 'success') {
     toastIcon.setAttribute('data-lucide', 'info');
     toastIcon.className = 'w-5 h-5 text-indigo-500';
   }
-  lucide.createIcons();
+  if (window.lucide) lucide.createIcons();
 
   toast.classList.add('show');
   toastTimeout = setTimeout(() => toast.classList.remove('show'), 2800);
 }
 
 // -------------------------------------------------------------
-// 4. Interim / Processing Indicator
+// 4. Interim / progress indicator (the TEMPORARY transcript)
 // -------------------------------------------------------------
 
 function showInterim(text) {
@@ -214,8 +460,33 @@ function hideInterim() {
   interimStream.classList.add('hidden');
 }
 
+/** Repaint the temporary-transcript panel from the current engine state. */
+function updateInterimState() {
+  const pending = transcriptionQueue.length + (activeJob ? 1 : 0);
+
+  if (partialText) {
+    showInterim(partialText);
+    return;
+  }
+  if (activeJob) {
+    showInterim(pending > 1
+      ? `⏳ Transcribing ${segmentsDone + 1} of ${segmentsDone + pending} segments…`
+      : '⏳ Transcribing…');
+    return;
+  }
+  if (speechActive) {
+    showInterim('🎙 Capturing speech…');
+    return;
+  }
+  if (appState === 'recording') {
+    showInterim('🎙 Listening…');
+    return;
+  }
+  hideInterim();
+}
+
 // -------------------------------------------------------------
-// 5. Microphone Permission & Support
+// 5. Microphone Permission & Browser Support
 // -------------------------------------------------------------
 
 async function checkMicrophonePermission() {
@@ -246,24 +517,35 @@ function updateMicPermissionUI(state) {
   }
 }
 
+function detectEngineSupport() {
+  const hasWebAssembly = typeof WebAssembly === 'object' && typeof WebAssembly.instantiate === 'function';
+  const hasWorker = typeof Worker === 'function';
+  const hasWebGPU = typeof navigator !== 'undefined' && Boolean(navigator.gpu);
+  const hasAudio = Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  return {
+    ok: hasWebAssembly && hasWorker && hasAudio,
+    hasWebGPU: hasWebGPU
+  };
+}
+
 // -------------------------------------------------------------
 // 6. Language Helpers
 // -------------------------------------------------------------
 
 /**
- * Normalize the language value returned by the ASR service. Providers differ:
- * OpenAI/Groq return either ISO-639-1 codes ('ml') or full names ('malayalam').
+ * Whisper returns the phrase in its own writing system, so the language can be
+ * labelled reliably from the script that is actually present in the text.
  */
-function langFromApi(value) {
-  if (!value) return null;
-  const v = String(value).toLowerCase().trim();
-  if (v.startsWith('ml') || v.startsWith('mal')) return LANG_CONFIG.MALAYALAM;
-  if (v.startsWith('ar')) return LANG_CONFIG.ARABIC;
-  if (v.startsWith('en')) return LANG_CONFIG.ENGLISH;
+function classifyText(text) {
+  if (!text || !text.trim()) return null;
+  if (SCRIPT_PATTERNS.arabic.test(text)) return LANG_CONFIG.ARABIC;
+  if (SCRIPT_PATTERNS.malayalam.test(text)) return LANG_CONFIG.MALAYALAM;
+  if (SCRIPT_PATTERNS.english.test(text)) return LANG_CONFIG.ENGLISH;
   return null;
 }
 
 function updateLanguageUI(langObj) {
+  if (!langObj) return;
   detectedLang = langObj;
   detectedLangName.textContent = langObj.name;
   detectedLangBadge.textContent = langObj.badge;
@@ -285,31 +567,8 @@ function updateLanguageUI(langObj) {
   }
 }
 
-/**
- * Browser-engine only: infer language from recognized TEXT via script ranges.
- * (The server engine detects language from the AUDIO and does not need this.)
- */
-function evaluateSpokenLanguage(phrase) {
-  if (!phrase || phrase.trim().length === 0) return null;
-
-  const hasMalayalam = SCRIPT_PATTERNS.malayalam.test(phrase);
-  const hasArabic = SCRIPT_PATTERNS.arabic.test(phrase);
-  const englishMatches = phrase.match(/[a-zA-Z]+/g) || [];
-
-  if (hasArabic) { consecutiveEnglishTokens = 0; return LANG_CONFIG.ARABIC; }
-  if (hasMalayalam) { consecutiveEnglishTokens = 0; return LANG_CONFIG.MALAYALAM; }
-
-  if (englishMatches.length > 0) {
-    consecutiveEnglishTokens += englishMatches.length;
-    if (consecutiveEnglishTokens >= 3) return LANG_CONFIG.ENGLISH;
-  } else {
-    consecutiveEnglishTokens = 0;
-  }
-  return null;
-}
-
 // -------------------------------------------------------------
-// 7. Segment Store — commit each recognized segment EXACTLY ONCE
+// 7. Segment Store — commit each decoded segment EXACTLY ONCE
 // -------------------------------------------------------------
 
 function makeSegmentId(prefix) {
@@ -337,8 +596,8 @@ function appendToTranscript(text) {
 }
 
 /**
- * Commit a recognized segment once. Duplicate ids are ignored, so a segment
- * can never be written to the transcript twice.
+ * Commit a decoded segment once. Duplicate ids are ignored, so a segment can
+ * never be written to the transcript twice.
  * NOTE: no text-based filtering — intentional repetitions are preserved.
  */
 function commitSegment(langCode, text, providedId) {
@@ -375,146 +634,15 @@ function clearSegments() {
 }
 
 // -------------------------------------------------------------
-// 8. SERVER ENGINE — MediaRecorder + Whisper via /api/transcribe
+// 8. Diagnostics helpers
 // -------------------------------------------------------------
 
-async function probeServerEngine() {
-  try {
-    const res = await fetch(SERVER_ASR_ENDPOINT, { method: 'GET', cache: 'no-store' });
-    if (!res.ok) throw new Error(`status ${res.status}`);
-    const data = await res.json();
-    serverConfigured = Boolean(data && data.configured);
-    serverProvider = (data && data.provider) || '';
-  } catch (err) {
-    serverConfigured = false;
-    serverProvider = '';
-  }
-
-  if (dbgSupported) {
-    if (serverConfigured) {
-      dbgSupported.textContent = `Yes (Whisper via ${serverProvider || 'server'})`;
-      dbgSupported.className = 'font-bold text-emerald-400 text-xs mt-0.5';
-    } else if (window.SpeechRecognition || window.webkitSpeechRecognition) {
-      dbgSupported.textContent = 'Yes (Browser Web Speech)';
-      dbgSupported.className = 'font-bold text-amber-400 text-xs mt-0.5';
-    } else {
-      dbgSupported.textContent = 'No (Unsupported)';
-      dbgSupported.className = 'font-bold text-rose-400 text-xs mt-0.5';
-    }
-  }
-  return serverConfigured;
-}
-
-function pickRecorderMime() {
-  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
-  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return '';
-  for (const type of candidates) {
-    if (MediaRecorder.isTypeSupported(type)) return type;
-  }
-  return '';
-}
-
-function beginChunk() {
-  if (!micStream || appState !== 'recording') return;
-
-  const mime = pickRecorderMime();
-  try {
-    chunkRecorder = mime ? new MediaRecorder(micStream, { mimeType: mime })
-                         : new MediaRecorder(micStream);
-  } catch (err) {
-    console.warn('MediaRecorder unavailable:', err);
-    return;
-  }
-
-  chunkParts = [];
-  chunkStartedAt = Date.now();
-  lastVoiceAt = Date.now();
-  sawSpeechInChunk = false;
-  peakRms = 0;
-  discardNextChunk = false;
-
-  chunkRecorder.ondataavailable = (e) => { if (e.data && e.data.size) chunkParts.push(e.data); };
-  chunkRecorder.onstop = () => {
-    const blob = new Blob(chunkParts, { type: chunkRecorder.mimeType || 'audio/webm' });
-    chunkParts = [];
-    if (discardNextChunk) {
-      discardNextChunk = false;          // silence-only audio is never sent
-    } else {
-      sendChunkForTranscription(blob);
-    }
-    if (appState === 'recording') beginChunk();
-  };
-
-  chunkRecorder.start();
-}
-
-function flushChunk() {
-  if (flushInFlight) return;
-  if (!chunkRecorder || chunkRecorder.state !== 'recording') return;
-  flushInFlight = true;
-  // A chunk that never contained speech is dropped rather than sent, so the
-  // ASR service is never asked to invent words from silence.
-  if (!sawSpeechInChunk) discardNextChunk = true;
-  try {
-    chunkRecorder.stop();
-  } catch (err) {
-    console.warn('Chunk flush notice:', err);
-  } finally {
-    // Released on the next tick; onstop fires synchronously after stop().
-    setTimeout(() => { flushInFlight = false; }, 0);
-  }
-}
-
-function startVadLoop() {
-  if (vadTimer) return;
-  vadTimer = setInterval(() => {
-    if (appState !== 'recording' || !analyser) return;
-
-    analyser.getByteTimeDomainData(vadBuffer);
-
-    let sum = 0;
-    for (let i = 0; i < vadBuffer.length; i++) {
-      const v = (vadBuffer[i] - 128) / 128;
-      sum += v * v;
-    }
-    const rms = Math.sqrt(sum / vadBuffer.length);
-    const now = Date.now();
-    if (rms > peakRms) peakRms = rms;
-
-    // Phase 1 — measure the room so the gate matches this microphone.
-    if (now - vadCalibrationAt < VAD.CALIBRATION_MS) {
-      noiseSamples.push(rms);
-      if (rms > VAD.MIN_GATE) { sawSpeechInChunk = true; lastVoiceAt = now; }
-      updateLevelDiagnostic(rms, VAD.MIN_GATE, true);
-      return;
-    }
-
-    // Phase 2 — derive the adaptive gate once, then use it.
-    if (noiseFloor === null) {
-      noiseFloor = noiseSamples.length
-        ? noiseSamples.reduce((a, b) => a + b, 0) / noiseSamples.length
-        : 0;
-      noiseSamples = [];
-    }
-    const gate = Math.max(VAD.MIN_GATE, noiseFloor * VAD.NOISE_MULTIPLIER);
-
-    if (rms > gate) {
-      sawSpeechInChunk = true;
-      lastVoiceAt = now;
-    }
-    updateLevelDiagnostic(rms, gate, false);
-
-    const chunkAge = now - chunkStartedAt;
-    const silentFor = now - lastVoiceAt;
-
-    if (sawSpeechInChunk && silentFor > VAD.SILENCE_FLUSH_MS && chunkAge > VAD.MIN_CHUNK_MS) {
-      flushChunk();                                    // natural pause: send now
-    } else if (chunkAge > VAD.PERIODIC_FLUSH_MS && peakRms > gate) {
-      flushChunk();                                    // continuous speech: don't wait
-    } else if (chunkAge > VAD.MAX_CHUNK_MS) {
-      flushChunk();                                    // safety cap (silence gets dropped)
-    }
-  }, VAD.INTERVAL_MS);
+function setErrorDiagnostic(text) {
+  if (!dbgError) return;
+  dbgError.textContent = text;
+  dbgError.className = text === 'None'
+    ? 'font-semibold text-slate-400 text-xs mt-0.5 truncate'
+    : 'font-semibold text-rose-400 text-xs mt-0.5 truncate';
 }
 
 /** Live mic-level readout so "it can't hear me" is diagnosable at a glance. */
@@ -537,426 +665,551 @@ function updateLevelDiagnostic(rms, gate, calibrating) {
   }
 }
 
-function stopVadLoop() {
-  if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
+// -------------------------------------------------------------
+// 9. Model loading (download progress)
+// -------------------------------------------------------------
+
+function setModelProgress(percent, statusText, isError) {
+  const pct = Math.max(0, Math.min(100, Math.round(percent || 0)));
+  if (modelBar) modelBar.style.width = pct + '%';
+  if (modelPct) modelPct.textContent = pct + '%';
+  if (modelStatus) {
+    modelStatus.textContent = statusText;
+    modelStatus.className = isError
+      ? 'text-rose-500 dark:text-rose-400'
+      : 'text-slate-500 dark:text-slate-400';
+  }
 }
 
-function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const result = String(reader.result || '');
-      resolve(result.slice(result.indexOf(',') + 1));
-    };
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
+function ensureWorker() {
+  if (asrWorker) return asrWorker;
+
+  const blob = new Blob([ASR_WORKER_SOURCE], { type: 'text/javascript' });
+  const url = URL.createObjectURL(blob);
+  asrWorker = new Worker(url, { type: 'module' });
+  asrWorker.onmessage = handleWorkerMessage;
+  asrWorker.onerror = (event) => {
+    setErrorDiagnostic('Worker error: ' + (event.message || 'unknown'));
+    setModelProgress(0, 'Inference worker failed to start.', true);
+    modelLoading = false;
+    loadModelBtn.disabled = false;
+    loadModelBtnText.textContent = 'Load Model';
+    if (modelLoadResolve) { modelLoadResolve(false); modelLoadResolve = null; }
+  };
+  return asrWorker;
+}
+
+function onModelFileProgress(payload) {
+  if (!payload) return;
+
+  if (payload.status === 'ready') return;
+
+  if (payload.file) {
+    const current = modelFileProgress.get(payload.file) || { loaded: 0, total: 0 };
+    if (payload.status === 'initiate') {
+      modelFileProgress.set(payload.file, { loaded: 0, total: payload.total || 0 });
+    } else if (payload.status === 'done') {
+      modelFileProgress.set(payload.file, { loaded: current.total || current.loaded, total: current.total || current.loaded });
+    } else {
+      modelFileProgress.set(payload.file, {
+        loaded: typeof payload.loaded === 'number' ? payload.loaded : current.loaded,
+        total: typeof payload.total === 'number' ? payload.total : current.total
+      });
+    }
+  }
+
+  let loaded = 0;
+  let total = 0;
+  modelFileProgress.forEach((entry) => { loaded += entry.loaded; total += entry.total; });
+
+  if (total > 0) {
+    const mb = (value) => (value / 1048576).toFixed(1);
+    setModelProgress((loaded / total) * 100, `Downloading ${mb(loaded)} MB / ${mb(total)} MB…`);
+  }
+}
+
+function loadModel(force) {
+  if (pendingModelLoad) return pendingModelLoad;
+
+  const key = modelSelect ? modelSelect.value : 'base';
+  const spec = MODEL_REGISTRY[key];
+  if (!spec) return Promise.resolve(false);
+  if (modelReady && loadedModelKey === key && !force) return Promise.resolve(true);
+
+  modelReady = false;
+  loadedModelKey = null;
+  modelFileProgress.clear();
+  setModelProgress(0, `Preparing ${spec.label}…`);
+  loadModelBtn.disabled = true;
+  loadModelBtnText.textContent = 'Loading…';
+
+  let workerRef;
+  try {
+    workerRef = ensureWorker();
+  } catch (err) {
+    loadModelBtn.disabled = false;
+    loadModelBtnText.textContent = 'Load Model';
+    setModelProgress(0, 'This browser cannot start the inference worker.', true);
+    showToast('This browser cannot run the on-device model. Use Chrome or Edge.', 'error');
+    return Promise.resolve(false);
+  }
+
+  modelLoading = true;
+  pendingModelKey = key;
+
+  return pendingModelLoad = new Promise((resolve) => {
+    modelLoadResolve = resolve;
+    workerRef.postMessage({
+      type: 'load',
+      model: spec.id,
+      device: deviceSelect ? deviceSelect.value : 'auto'
+    });
   });
 }
 
-async function sendChunkForTranscription(blob) {
-  if (!blob || blob.size < 1500) return;   // silence / blip — nothing to send
+function handleWorkerMessage(event) {
+  const msg = event.data || {};
 
-  pendingTranscriptions += 1;
-  showInterim(pendingTranscriptions > 1
-    ? `⏳ Transcribing ${pendingTranscriptions} segments…`
-    : '⏳ Transcribing…');
+  if (msg.type === 'status') {
+    setModelProgress(currentPercent(), msg.message);
+    return;
+  }
 
-  const languageHint = activeMode === 'auto' ? null : activeMode.split('-')[0];
+  if (msg.type === 'progress') {
+    if (modelLoading) onModelFileProgress(msg.payload);
+    return;
+  }
 
-  try {
-    const base64 = await blobToBase64(blob);
-    const res = await fetch(SERVER_ASR_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audio: base64, mimeType: blob.type || 'audio/webm', languageHint })
-    });
+  if (msg.type === 'loaded') {
+    modelReady = true;
+    modelLoading = false;
+    loadedModelKey = pendingModelKey;
+    loadedDeviceLabel = msg.device === 'webgpu' ? 'WebGPU (GPU)' : 'WebAssembly (CPU)';
+    const spec = MODEL_REGISTRY[loadedModelKey] || { label: 'Whisper' };
+    loadModelBtn.disabled = false;
+    loadModelBtnText.textContent = 'Model Ready';
+    setModelProgress(100, `${spec.label} ready · ${loadedDeviceLabel}`);
+    showToast(`${spec.label} loaded on ${loadedDeviceLabel}. Press Start and speak.`, 'success');
+    resolveModelLoad(true);
+    pumpQueue();
+    return;
+  }
 
-    if (!res.ok) {
-      const info = await res.json().catch(() => ({}));
-      const detail = extractUpstreamMessage(info);
-      setErrorDiagnostic(`Error: ${info.error || res.status}${detail ? ' – ' + detail : ''}`);
-
-      if (res.status === 503) {
-        serverConfigured = false;
-        showToast('Server transcription is not configured (missing API key).', 'error');
-      } else if (res.status === 504) {
-        showToast('Transcription timed out. Check your connection.', 'warning');
-      } else {
-        showToast(`Transcription failed: ${detail || 'server error'}.`, 'error');
-      }
-
-      registerServerFailure();
-      return;
+  if (msg.type === 'partial') {
+    if (activeJob && msg.id === activeJob.id) {
+      partialText = msg.text;
+      updateInterimState();
     }
+    return;
+  }
 
-    serverFailures = 0;
+  if (msg.type === 'result') {
+    onTranscribeResult(msg);
+    return;
+  }
 
-    const data = await res.json();
-
-    if (data && data.text) {
-      const langObj = langFromApi(data.language) || detectedLang;
-      // Unique id per chunk => committed exactly once.
-      commitSegment(langObj.code, data.text, makeSegmentId('chunk'));
-    } else if (dbgResult) {
-      recordSegmentDiagnostic();
-    }
-
-    setErrorDiagnostic('None');
-  } catch (err) {
-    setErrorDiagnostic('Error: network');
-    showToast('Network interruption while transcribing. Will continue.', 'warning');
-    registerServerFailure();
-  } finally {
-    pendingTranscriptions = Math.max(0, pendingTranscriptions - 1);
-    if (pendingTranscriptions === 0) {
-      if (appState === 'recording') showInterim('🎙 Listening…');
-      else hideInterim();
+  if (msg.type === 'error') {
+    if (msg.scope === 'load') {
+      modelLoading = false;
+      modelReady = false;
+      loadModelBtn.disabled = false;
+      loadModelBtnText.textContent = 'Load Model';
+      setModelProgress(0, 'Model load failed.', true);
+      setErrorDiagnostic('Error: ' + msg.message);
+      showToast('Could not load the model: ' + msg.message, 'error');
+      resolveModelLoad(false);
     } else {
-      showInterim(`⏳ Transcribing ${pendingTranscriptions} segments…`);
+      onTranscribeError(msg);
     }
   }
 }
 
-function setErrorDiagnostic(text) {
-  if (!dbgError) return;
-  dbgError.textContent = text;
-  dbgError.className = text === 'None'
-    ? 'font-semibold text-slate-400 text-xs mt-0.5 truncate'
-    : 'font-semibold text-rose-400 text-xs mt-0.5 truncate';
+function currentPercent() {
+  const raw = modelPct ? parseInt(String(modelPct.textContent).replace('%', ''), 10) : 0;
+  return Number.isFinite(raw) ? raw : 0;
 }
 
-/** Pull a human-readable reason out of an upstream error payload. */
-function extractUpstreamMessage(info) {
-  if (!info || typeof info.detail !== 'string' || !info.detail) return '';
+function resolveModelLoad(value) {
+  pendingModelLoad = null;
+  if (modelLoadResolve) {
+    modelLoadResolve(value);
+    modelLoadResolve = null;
+  }
+}
+
+// -------------------------------------------------------------
+// 10. Transcription queue (one decode at a time, in capture order)
+// -------------------------------------------------------------
+
+function enqueueChunk(samples, durationMs) {
+  const id = makeSegmentId('chunk');
+  segmentsQueued += 1;
+  transcriptionQueue.push({ id, samples, durationMs, generation: transcriptGeneration });
+  updateInterimState();
+  pumpQueue();
+}
+
+function pumpQueue() {
+  if (activeJob) return;
+  if (transcriptionQueue.length === 0) { updateInterimState(); return; }
+  if (!modelReady || !asrWorker) return;
+
+  activeJob = transcriptionQueue.shift();
+  partialText = '';
+  updateInterimState();
+
   try {
-    const parsed = JSON.parse(info.detail);
-    const msg = parsed && parsed.error && parsed.error.message;
-    if (msg) return msg;
-  } catch (e) { /* detail was not JSON */ }
-  return info.detail.slice(0, 120);
+    asrWorker.postMessage({
+      type: 'transcribe',
+      id: activeJob.id,
+      audio: activeJob.samples,
+      language: activeMode === 'auto' ? null : activeMode.split('-')[0]
+    }, [activeJob.samples.buffer]);
+  } catch (err) {
+    setErrorDiagnostic('Error: ' + (err && err.message ? err.message : 'post failed'));
+    activeJob = null;
+    pumpQueue();
+  }
+}
+
+function onTranscribeResult(msg) {
+  const job = activeJob;
+  activeJob = null;
+  partialText = '';
+
+  if (job && msg.id === job.id) {
+    segmentsDone += 1;
+    if (job.generation === transcriptGeneration && msg.text) {
+      // The script actually present in the text is checked first; the language
+      // Whisper detected is used when the text alone is ambiguous.
+      const reported = msg.language
+        ? Object.values(LANG_CONFIG).find((l) => l.short === msg.language)
+        : null;
+      const langObj = classifyText(msg.text) || reported || detectedLang;
+      commitSegment(langObj.code, msg.text, job.id);
+    }
+  }
+
+  updateInterimState();
+  pumpQueue();
+}
+
+function onTranscribeError(msg) {
+  activeJob = null;
+  partialText = '';
+  segmentsDone += 1;
+  setErrorDiagnostic('Error: ' + msg.message);
+  showToast('A segment could not be transcribed. Continuing.', 'warning');
+  updateInterimState();
+  pumpQueue();
+}
+
+// -------------------------------------------------------------
+// 11. Audio capture — 16 kHz mono PCM + adaptive VAD chunking
+// -------------------------------------------------------------
+
+function resetVadState() {
+  noiseFloor = null;
+  noiseSamples = [];
+  prerollFrames = [];
+  chunkFrames = [];
+  speechActive = false;
+  onsetMs = 0;
+  silenceMs = 0;
+  leftover = new Float32Array(0);
+}
+
+function resampleLinear(input, inRate, outRate) {
+  if (inRate === outRate) return input;
+  const ratio = inRate / outRate;
+  const outLength = Math.max(1, Math.floor(input.length / ratio));
+  const out = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const pos = i * ratio;
+    const i0 = Math.floor(pos);
+    const i1 = i0 + 1 < input.length ? i0 + 1 : input.length - 1;
+    const frac = pos - i0;
+    out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+  }
+  return out;
+}
+
+function onAudioProcess(event) {
+  if (appState !== 'recording') return;
+
+  const channel = event.inputBuffer.getChannelData(0);
+  const samples = captureSampleRate === AUDIO.SAMPLE_RATE
+    ? channel
+    : resampleLinear(channel, captureSampleRate, AUDIO.SAMPLE_RATE);
+
+  const merged = new Float32Array(leftover.length + samples.length);
+  merged.set(leftover, 0);
+  merged.set(samples, leftover.length);
+
+  let offset = 0;
+  while (merged.length - offset >= FRAME_SIZE) {
+    processFrame(merged.subarray(offset, offset + FRAME_SIZE));
+    offset += FRAME_SIZE;
+  }
+
+  leftover = merged.slice(offset);
+}
+
+function processFrame(frame) {
+  let sum = 0;
+  for (let i = 0; i < frame.length; i++) {
+    const v = frame[i];
+    sum += v * v;
+  }
+  const rms = Math.sqrt(sum / frame.length);
+
+  // Phase 1 — measure the room so the gate matches this microphone.
+  if (noiseFloor === null) {
+    noiseSamples.push(rms);
+    if (noiseSamples.length >= CALIBRATION_FRAMES) {
+      let total = 0;
+      for (let i = 0; i < noiseSamples.length; i++) total += noiseSamples[i];
+      noiseFloor = total / noiseSamples.length;
+      noiseSamples = [];
+    }
+  }
+
+  const gate = noiseFloor === null
+    ? AUDIO.MIN_GATE
+    : Math.max(AUDIO.MIN_GATE, noiseFloor * AUDIO.NOISE_MULTIPLIER);
+
+  const voiced = rms > gate;
+  updateLevelDiagnostic(rms, gate, noiseFloor === null);
+
+  // Phase 2 — build a chunk only around actual speech.
+  if (!speechActive) {
+    prerollFrames.push(frame.slice());
+    if (prerollFrames.length > PREROLL_FRAMES) prerollFrames.shift();
+
+    onsetMs = voiced ? onsetMs + AUDIO.FRAME_MS : 0;
+
+    if (onsetMs >= AUDIO.MIN_SPEECH_MS) {
+      speechActive = true;
+      chunkFrames = prerollFrames;   // keeps the audio captured just before onset
+      prerollFrames = [];
+      silenceMs = 0;
+      updateInterimState();
+    }
+    return;
+  }
+
+  chunkFrames.push(frame.slice());
+  silenceMs = voiced ? 0 : silenceMs + AUDIO.FRAME_MS;
+
+  const chunkMs = chunkFrames.length * AUDIO.FRAME_MS;
+  const closedOnPause = silenceMs >= AUDIO.SILENCE_CLOSE_MS && chunkMs >= AUDIO.MIN_CHUNK_MS;
+
+  if (closedOnPause || chunkMs >= AUDIO.MAX_CHUNK_MS) closeChunk();
 }
 
 /**
- * If the server engine keeps failing, stop relying on it: the next Start
- * falls back to the browser engine so the user is never left with an app
- * that silently produces nothing.
+ * Turn the frames collected so far into one DISJOINT chunk of 16 kHz mono
+ * audio. Trailing silence is trimmed but a little is kept so the final word is
+ * never clipped. Silence-only audio is discarded rather than sent to Whisper
+ * (Whisper invents words when it is fed pure silence).
  */
-function registerServerFailure() {
-  serverFailures += 1;
-  if (serverFailures >= 2 && serverConfigured) {
-    serverConfigured = false;
-    showToast('Server transcription unavailable — browser engine will be used on next Start.', 'error');
+function closeChunk() {
+  const frames = chunkFrames;
+  const trailingSilence = silenceMs;
+
+  chunkFrames = [];
+  speechActive = false;
+  onsetMs = 0;
+  silenceMs = 0;
+
+  if (frames.length === 0) { updateInterimState(); return; }
+
+  const frameLength = frames[0].length;
+  let endFrame = frames.length;
+  if (trailingSilence > AUDIO.TAIL_KEEP_MS) {
+    const drop = Math.floor((trailingSilence - AUDIO.TAIL_KEEP_MS) / AUDIO.FRAME_MS);
+    endFrame = Math.max(1, endFrame - drop);
   }
+
+  const totalSamples = endFrame * frameLength;
+  const durationMs = (totalSamples / AUDIO.SAMPLE_RATE) * 1000;
+  if (durationMs < AUDIO.MIN_CHUNK_MS) { updateInterimState(); return; }
+
+  const flat = new Float32Array(totalSamples);
+  for (let i = 0; i < endFrame; i++) flat.set(frames[i], i * frameLength);
+
+  enqueueChunk(flat, durationMs);
+  updateInterimState();
 }
 
-async function startServerEngine() {
+async function startCapture() {
   try {
     micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
     });
   } catch (err) {
     updateMicPermissionUI('denied');
-    showToast('Microphone access blocked. Allow it in the Chrome URL bar and retry.', 'error');
+    showToast('Microphone access blocked. Allow it in the address bar and try again.', 'error');
     return false;
   }
 
   updateMicPermissionUI('granted');
 
-  audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  const source = audioContext.createMediaStreamSource(micStream);
-  analyser = audioContext.createAnalyser();
-  analyser.fftSize = 2048;
-  vadBuffer = new Uint8Array(analyser.fftSize);
-  source.connect(analyser);
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  try {
+    audioContext = new AudioCtx({ sampleRate: AUDIO.SAMPLE_RATE });
+  } catch (err) {
+    audioContext = new AudioCtx();
+  }
+  if (audioContext.state === 'suspended') {
+    try { await audioContext.resume(); } catch (err) { /* resumed by the gesture */ }
+  }
+  captureSampleRate = audioContext.sampleRate || AUDIO.SAMPLE_RATE;
 
-  if (dbgAudio) { dbgAudio.textContent = 'Yes (Mic Streaming)'; dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
-  if (dbgStarted) { dbgStarted.textContent = 'Yes (Server Engine)'; dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
+  sourceNode = audioContext.createMediaStreamSource(micStream);
+  processorNode = audioContext.createScriptProcessor(AUDIO.PROCESSOR_BUFFER, 1, 1);
+  processorNode.onaudioprocess = onAudioProcess;
+  sourceNode.connect(processorNode);
 
-  vadCalibrationAt = Date.now();
-  noiseFloor = null;
-  noiseSamples = [];
+  // ScriptProcessor only runs when connected to the output; the gain node keeps
+  // it silent so nothing is played back through the speakers.
+  muteNode = audioContext.createGain();
+  muteNode.gain.value = 0;
+  processorNode.connect(muteNode);
+  muteNode.connect(audioContext.destination);
 
-  beginChunk();
-  startVadLoop();
+  resetVadState();
+
+  if (dbgAudio) { dbgAudio.textContent = `Yes (${Math.round(captureSampleRate / 1000)} kHz PCM → 16 kHz)`; dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
+  if (dbgStarted) { dbgStarted.textContent = 'Capturing…'; dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
   return true;
 }
 
-function stopServerEngine() {
-  stopVadLoop();
-
-  if (chunkRecorder && chunkRecorder.state === 'recording') {
-    try { chunkRecorder.stop(); } catch (err) { /* noop */ }
+function stopCapture() {
+  if (processorNode) {
+    processorNode.onaudioprocess = null;
+    try { processorNode.disconnect(); } catch (err) { /* noop */ }
+    processorNode = null;
   }
-  chunkRecorder = null;
-
+  if (sourceNode) {
+    try { sourceNode.disconnect(); } catch (err) { /* noop */ }
+    sourceNode = null;
+  }
+  if (muteNode) {
+    try { muteNode.disconnect(); } catch (err) { /* noop */ }
+    muteNode = null;
+  }
   if (micStream) {
-    micStream.getTracks().forEach(t => t.stop());
+    micStream.getTracks().forEach((track) => track.stop());
     micStream = null;
   }
   if (audioContext && audioContext.state !== 'closed') {
-    audioContext.close().catch(() => {});
+    try { audioContext.close(); } catch (err) { /* noop */ }
   }
   audioContext = null;
-  analyser = null;
-  vadBuffer = null;
+
+  resetVadState();
 
   if (dbgAudio) { dbgAudio.textContent = 'No'; dbgAudio.className = 'font-bold text-slate-400 text-xs mt-0.5'; }
-  if (dbgStarted) { dbgStarted.textContent = 'No (Ended)'; dbgStarted.className = 'font-bold text-slate-400 text-xs mt-0.5'; }
-  if (dbgSpeech) { dbgSpeech.textContent = 'No'; dbgSpeech.className = 'font-bold text-slate-400 text-xs mt-0.5'; }
+  if (dbgStarted) { dbgStarted.textContent = 'Idle'; dbgStarted.className = 'font-bold text-slate-400 text-xs mt-0.5'; }
+}
+
+/** Close whatever phrase is in progress so a pause never loses speech. */
+function flushPendingAudio() {
+  if (speechActive) closeChunk();
 }
 
 // -------------------------------------------------------------
-// 9. BROWSER ENGINE — Web Speech API (fallback), append-only
+// 12. Session Controls
 // -------------------------------------------------------------
 
-function initSpeechRecognition() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) return null;
+async function ensureModelForSession() {
+  const key = modelSelect ? modelSelect.value : 'base';
+  if (modelReady && loadedModelKey === key) return true;
 
-  const rec = new SpeechRecognition();
-  rec.continuous = true;
-  rec.interimResults = true;
-  rec.maxAlternatives = 1;
-  rec.lang = currentLangCode;
+  if (modelLoading) {
+    showToast('The model is still loading — one moment…', 'warning');
+    return false;
+  }
 
-  rec.onstart = () => {
-    isRestarting = false;
-    rapidRestartCount = 0;
-    appState = 'recording';
-    updateControls();
-    updateStatus('listening');
-    startTimer();
-    if (dbgStarted) { dbgStarted.textContent = 'Yes (Browser Engine)'; dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
-    if (dbgAudio) { dbgAudio.textContent = 'Connecting...'; dbgAudio.className = 'font-bold text-amber-400 text-xs mt-0.5'; }
-  };
-
-  rec.onaudiostart = () => {
-    if (dbgAudio) { dbgAudio.textContent = 'Yes (Mic Streaming)'; dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
-  };
-
-  rec.onspeechstart = () => {
-    if (dbgSpeech) { dbgSpeech.textContent = 'Speech Detected'; dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
-  };
-
-  // APPEND-ONLY handler — starts at event.resultIndex, never rebuilds.
-  rec.onresult = (event) => {
-    let currentInterim = '';
-
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const result = event.results[i];
-      const piece = result[0].transcript;
-
-      if (result.isFinal) {
-        // Unique per (session, resultIndex, index) => committed exactly once.
-        commitSegment(
-          (activeMode === 'auto'
-            ? (evaluateSpokenLanguage(piece) || detectedLang).code
-            : currentLangCode),
-          piece,
-          `ws-${sessionSeq}-${event.resultIndex}-${i}`
-        );
-      } else {
-        currentInterim += piece;
-      }
-    }
-
-    resultCount = event.results.length;
-    updateCounters();
-    textEditor.scrollTop = textEditor.scrollHeight;
-
-    if (currentInterim) showInterim(currentInterim);
-    else hideInterim();
-  };
-
-  rec.onerror = (event) => {
-    setErrorDiagnostic(`Error: ${event.error}`);
-
-    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-      showToast('Microphone access blocked. Allow it in the Chrome URL bar.', 'error');
-      stopSession();
-      updateMicPermissionUI('denied');
-      return;
-    }
-    if (event.error === 'audio-capture') {
-      showToast('No microphone found. Please connect one.', 'error');
-      stopSession();
-      return;
-    }
-    if (event.error === 'no-speech') return;   // normal pause in speech
-    if (event.error === 'network') {
-      showToast('Network error reaching the speech service.', 'error');
-    }
-  };
-
-  rec.onend = () => {
-    isRestarting = false;
-    hideInterim();
-
-    if (appState === 'recording' && !isIntentionalStop) {
-      const now = Date.now();
-      rapidRestartCount = (now - lastEndAt < 400) ? rapidRestartCount + 1 : 0;
-      lastEndAt = now;
-
-      if (rapidRestartCount > 5) {
-        appState = 'stopped';
-        isIntentionalStop = true;
-        updateStatus('stopped');
-        updateControls();
-        stopTimer();
-        showToast('Recognition stopped after repeated errors. Press Start to retry.', 'error');
-        return;
-      }
-
-      setTimeout(() => {
-        if (appState === 'recording') {
-          try { rec.lang = currentLangCode; rec.start(); }
-          catch (err) { console.warn('Auto-restart notice:', err); }
-        }
-      }, 150);
-      return;
-    }
-
-    if (appState === 'paused') { updateStatus('paused'); updateControls(); stopTimer(); }
-    else if (appState === 'stopped') { updateStatus('stopped'); updateControls(); stopTimer(); }
-  };
-
-  return rec;
+  showToast('Downloading the on-device Whisper model…', 'info');
+  return await loadModel();
 }
-
-// -------------------------------------------------------------
-// 10. Session Controls (route to the active engine)
-// -------------------------------------------------------------
-
-let sessionSeq = 0;
 
 async function startSession() {
-  isIntentionalStop = false;
-  isRestarting = false;
-  resultCount = 0;
-  sessionSeq += 1;
-
-  finalTranscript = textEditor.value;
   setErrorDiagnostic('None');
+  finalTranscript = textEditor.value;
 
-  // Decide the engine once (probe if not yet known).
-  if (serverConfigured === null) await probeServerEngine();
-
-  if (serverConfigured) {
-    engineMode = 'server';
-    const ok = await startServerEngine();
-    if (ok) {
-      appState = 'recording';
-      updateControls();
-      updateStatus('listening');
-      startTimer();
-      showInterim('🎙 Listening…');
-      showToast('Listening — language is detected automatically from your voice.', 'info');
-    }
-    return;
-  }
-
-  // Fallback: browser Web Speech API
-  engineMode = 'browser';
-  if (!recognition) recognition = initSpeechRecognition();
-
-  if (!recognition) {
+  const support = detectEngineSupport();
+  if (!support.ok) {
     if (unsupportedAlert) unsupportedAlert.classList.remove('hidden');
     updateStatus('unsupported');
-    if (startBtn) startBtn.disabled = true;
-    showToast('No speech engine available in this browser. Use Google Chrome.', 'error');
+    showToast('This browser cannot run the on-device engine. Use Chrome or Edge.', 'error');
     return;
   }
 
-  recognition.lang = currentLangCode;
-  try {
-    recognition.start();
-    showToast(`Microphone active (browser engine). Listening in ${detectedLang.name}…`, 'info');
-  } catch (err) {
-    console.warn('Recognition start caught:', err);
-  }
+  const ready = await ensureModelForSession();
+  if (!ready) return;
+
+  const captured = await startCapture();
+  if (!captured) return;
+
+  appState = 'recording';
+  updateControls();
+  updateStatus('listening');
+  startTimer();
+  updateInterimState();
+  showToast('Listening on your device — Whisper detects the language automatically.', 'info');
 }
 
 function pauseSession() {
   if (appState !== 'recording') return;
 
+  flushPendingAudio();
+  stopCapture();
+
   appState = 'paused';
-  isIntentionalStop = true;
-
-  if (engineMode === 'server') {
-    flushChunk();               // transcribe whatever phrase was in progress
-    stopVadLoop();
-    if (chunkRecorder) { try { chunkRecorder.stop(); } catch (e) { /* noop */ } }
-    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-  } else if (recognition) {
-    try { recognition.stop(); } catch (err) { console.warn(err); }
-  }
-
-  hideInterim();
   stopTimer();
   updateStatus('paused');
   updateControls();
-  showToast('Recording paused. Text preserved.', 'info');
+  updateInterimState();
+  showToast('Paused. Your text is preserved.', 'info');
 }
 
 async function resumeSession() {
   if (appState !== 'paused') return;
 
-  isIntentionalStop = false;
   finalTranscript = textEditor.value;
 
-  if (engineMode === 'server') {
-    const ok = await startServerEngine();
-    if (ok) {
-      appState = 'recording';
-      updateControls();
-      updateStatus('listening');
-      startTimer();
-      showInterim('🎙 Listening…');
-      showToast('Resumed — listening.', 'info');
-    }
-    return;
-  }
+  const captured = await startCapture();
+  if (!captured) return;
 
-  if (!recognition) recognition = initSpeechRecognition();
-  if (!recognition) return;
-
-  recognition.lang = currentLangCode;
-  try {
-    recognition.start();
-    appState = 'recording';
-    updateControls();
-    updateStatus('listening');
-    startTimer();
-    showToast(`Resumed (${detectedLang.name})…`, 'info');
-  } catch (err) {
-    console.warn('Resume notice:', err);
-  }
+  appState = 'recording';
+  updateControls();
+  updateStatus('listening');
+  startTimer();
+  updateInterimState();
+  showToast('Resumed — listening.', 'info');
 }
 
 function stopSession() {
   if (appState === 'idle' || appState === 'stopped') return;
 
+  flushPendingAudio();
+  stopCapture();
+
   appState = 'stopped';
-  isIntentionalStop = true;
-
-  if (engineMode === 'server') {
-    flushChunk();
-    stopServerEngine();
-  } else if (recognition) {
-    try { recognition.stop(); } catch (err) { console.warn(err); }
-  }
-
-  hideInterim();
   finalTranscript = textEditor.value;
   updateCounters();
   stopTimer();
   updateStatus('stopped');
   updateControls();
-  showToast('Recording session stopped.', 'info');
+  updateInterimState();
+  showToast('Recording stopped. Remaining audio is still being transcribed.', 'info');
 }
 
 // -------------------------------------------------------------
-// 11. Controls & Status
+// 13. Controls & Status
 // -------------------------------------------------------------
 
 function updateControls() {
@@ -970,6 +1223,12 @@ function updateControls() {
     startBtn.disabled = false; pauseBtn.disabled = true;
     resumeBtn.disabled = true;  stopBtn.disabled = true;
   }
+
+  // The backend/model cannot be swapped while audio is being captured.
+  const lockEngineChoice = appState === 'recording';
+  if (modelSelect) modelSelect.disabled = lockEngineChoice;
+  if (deviceSelect) deviceSelect.disabled = lockEngineChoice;
+  if (loadModelBtn) loadModelBtn.disabled = lockEngineChoice || modelLoading;
 }
 
 function updateStatus(status) {
@@ -999,7 +1258,7 @@ function updateStatus(status) {
 }
 
 // -------------------------------------------------------------
-// 12. Language Chips (Auto detect + optional manual hint)
+// 14. Language Chips (Auto detect + optional manual hint)
 // -------------------------------------------------------------
 
 langChips.forEach(chip => {
@@ -1013,7 +1272,7 @@ langChips.forEach(chip => {
     if (mode === 'auto') {
       currentLangCode = LANG_CONFIG.MALAYALAM.code;
       updateLanguageUI(LANG_CONFIG.MALAYALAM);
-      showToast('Auto-detect enabled — language identified from your voice.', 'info');
+      showToast('Auto-detect enabled — Whisper identifies the language from your voice.', 'info');
     } else {
       currentLangCode = mode;
       const langObj = Object.values(LANG_CONFIG).find(l => l.code === mode) || LANG_CONFIG.MALAYALAM;
@@ -1024,7 +1283,7 @@ langChips.forEach(chip => {
 });
 
 // -------------------------------------------------------------
-// 13. Timer (MM:SS)
+// 15. Timer (MM:SS)
 // -------------------------------------------------------------
 
 function startTimer() {
@@ -1045,7 +1304,7 @@ function renderTimer() {
 }
 
 // -------------------------------------------------------------
-// 14. Word & Character Counters
+// 16. Word & Character Counters
 // -------------------------------------------------------------
 
 function updateCounters() {
@@ -1063,7 +1322,49 @@ textEditor.addEventListener('input', () => {
 });
 
 // -------------------------------------------------------------
-// 15. Actions (Copy, Download TXT, Clear, Select All)
+// 17. On-Device Engine Card listeners
+// -------------------------------------------------------------
+
+if (loadModelBtn) {
+  loadModelBtn.addEventListener('click', async () => {
+    if (modelReady && loadedModelKey === (modelSelect ? modelSelect.value : '')) {
+      showToast('That model is already loaded.', 'info');
+      return;
+    }
+    await loadModel();
+  });
+}
+
+if (modelSelect) {
+  modelSelect.addEventListener('change', () => {
+    if (appState === 'recording') return;
+    const key = modelSelect.value;
+    if (key === loadedModelKey && modelReady) return;
+
+    // A different model means the queued audio can no longer be decoded.
+    transcriptionQueue.length = 0;
+    segmentsQueued = segmentsDone;
+    modelReady = false;
+    loadedModelKey = null;
+    loadModelBtnText.textContent = 'Load Model';
+    setModelProgress(0, 'Model changed — click Load Model.');
+    updateInterimState();
+  });
+}
+
+if (deviceSelect) {
+  deviceSelect.addEventListener('change', () => {
+    if (appState === 'recording') return;
+    const spec = MODEL_REGISTRY[modelSelect ? modelSelect.value : 'base'];
+    modelReady = false;
+    loadedModelKey = null;
+    loadModelBtnText.textContent = 'Load Model';
+    setModelProgress(0, `Backend changed — reload ${spec ? spec.label : 'the model'}.`);
+  });
+}
+
+// -------------------------------------------------------------
+// 18. Actions (Copy, Download TXT, Clear, Select All)
 // -------------------------------------------------------------
 
 copyBtn.addEventListener('click', async () => {
@@ -1075,14 +1376,14 @@ copyBtn.addEventListener('click', async () => {
     copyBtnText.textContent = 'Copied!';
     copyIcon.setAttribute('data-lucide', 'check');
     copyBtn.classList.add('bg-emerald-50', 'text-emerald-700', 'border-emerald-300', 'dark:bg-emerald-950/50', 'dark:text-emerald-300');
-    lucide.createIcons();
+    if (window.lucide) lucide.createIcons();
     showToast('Text copied to clipboard!', 'success');
 
     setTimeout(() => {
       copyBtnText.textContent = 'Copy Text';
       copyIcon.setAttribute('data-lucide', 'copy');
       copyBtn.classList.remove('bg-emerald-50', 'text-emerald-700', 'border-emerald-300', 'dark:bg-emerald-950/50', 'dark:text-emerald-300');
-      lucide.createIcons();
+      if (window.lucide) lucide.createIcons();
     }, 2000);
   } catch (err) {
     console.error('Clipboard copy failed:', err);
@@ -1117,14 +1418,21 @@ clearBtn.addEventListener('click', () => {
   if (!textEditor.value.trim()) return;
 
   if (confirm('Are you sure you want to clear the entire text editor?')) {
+    // Invalidate anything still decoding so it cannot repopulate the editor.
+    transcriptGeneration += 1;
+    transcriptionQueue.length = 0;
+    activeJob = null;
+    partialText = '';
+    segmentsDone = 0;
+    segmentsQueued = 0;
+
     textEditor.value = '';
     finalTranscript = '';
-    resultCount = 0;
     clearSegments();
     hideInterim();
     resetTimer();
     updateCounters();
-    if (dbgResult) dbgResult.textContent = '0 results received';
+    if (dbgResult) dbgResult.textContent = '0 segments transcribed';
     showToast('Text editor cleared.', 'info');
   }
 });
@@ -1137,7 +1445,7 @@ selectAllBtn.addEventListener('click', () => {
 });
 
 // -------------------------------------------------------------
-// 16. Button Listeners
+// 19. Button Listeners
 // -------------------------------------------------------------
 
 startBtn.addEventListener('click', () => { resetTimer(); startSession(); });
@@ -1146,7 +1454,7 @@ resumeBtn.addEventListener('click', () => { resumeSession(); });
 stopBtn.addEventListener('click', () => { stopSession(); });
 
 // -------------------------------------------------------------
-// 17. Keyboard Shortcuts
+// 20. Keyboard Shortcuts
 // -------------------------------------------------------------
 
 document.addEventListener('keydown', (e) => {
@@ -1163,8 +1471,11 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+// Release the microphone if the page is closed while recording.
+window.addEventListener('beforeunload', () => { if (micStream) stopCapture(); });
+
 // -------------------------------------------------------------
-// 18. Light / Dark Theme
+// 21. Light / Dark Theme
 // -------------------------------------------------------------
 
 function applyTheme(isDark) {
@@ -1179,7 +1490,7 @@ function applyTheme(isDark) {
     themeIcon.setAttribute('data-lucide', 'moon');
     localStorage.setItem('voicetype_theme', 'light');
   }
-  lucide.createIcons();
+  if (window.lucide) lucide.createIcons();
 }
 
 themeToggleBtn.addEventListener('click', () => {
@@ -1187,11 +1498,11 @@ themeToggleBtn.addEventListener('click', () => {
 });
 
 // -------------------------------------------------------------
-// 19. Bootstrap
+// 22. Bootstrap
 // -------------------------------------------------------------
 
-window.addEventListener('DOMContentLoaded', async () => {
-  lucide.createIcons();
+window.addEventListener('DOMContentLoaded', () => {
+  if (window.lucide) lucide.createIcons();
 
   applyTheme((localStorage.getItem('voicetype_theme') || 'light') === 'dark');
 
@@ -1200,14 +1511,28 @@ window.addEventListener('DOMContentLoaded', async () => {
   updateStatus('ready');
   updateCounters();
   updateLanguageUI(LANG_CONFIG.MALAYALAM);
+  setModelProgress(0, 'Model not loaded yet.');
 
-  // Pre-flight: is the server engine available? If not, prepare the fallback.
-  const configured = await probeServerEngine();
-  if (configured) {
-    showToast('Multilingual engine ready — press Start and speak.', 'success');
-  } else {
-    recognition = initSpeechRecognition();
-    if (!recognition && unsupportedAlert) unsupportedAlert.classList.remove('hidden');
-    showToast('Server engine not configured — using browser speech engine.', 'warning');
+  const support = detectEngineSupport();
+  if (!support.ok) {
+    if (unsupportedAlert) unsupportedAlert.classList.remove('hidden');
+    updateStatus('unsupported');
+    startBtn.disabled = true;
+    if (loadModelBtn) loadModelBtn.disabled = true;
+    if (dbgSupported) {
+      dbgSupported.textContent = 'No (Unsupported)';
+      dbgSupported.className = 'font-bold text-rose-400 text-xs mt-0.5';
+    }
+    setModelProgress(0, 'WebAssembly worker unavailable in this browser.', true);
+    return;
   }
+
+  if (dbgSupported) {
+    dbgSupported.textContent = support.hasWebGPU
+      ? 'Yes (On-device · WebGPU available)'
+      : 'Yes (On-device · WebAssembly)';
+    dbgSupported.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+  }
+
+  showToast('On-device engine ready. Press Load Model, then Start.', 'info');
 });
