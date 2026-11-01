@@ -92,6 +92,7 @@ let chunkStartedAt = 0;
 let lastVoiceAt = 0;
 let sawSpeechInChunk = false;
 let pendingTranscriptions = 0;
+let serverFailures = 0;
 let flushInFlight = false;
 
 // RTL embedding marks so Arabic segments render right-to-left in a plain textarea
@@ -505,17 +506,23 @@ async function sendChunkForTranscription(blob) {
 
     if (!res.ok) {
       const info = await res.json().catch(() => ({}));
-      setErrorDiagnostic(`Error: ${info.error || res.status}`);
+      const detail = extractUpstreamMessage(info);
+      setErrorDiagnostic(`Error: ${info.error || res.status}${detail ? ' – ' + detail : ''}`);
+
       if (res.status === 503) {
         serverConfigured = false;
         showToast('Server transcription is not configured (missing API key).', 'error');
       } else if (res.status === 504) {
         showToast('Transcription timed out. Check your connection.', 'warning');
       } else {
-        showToast('Transcription failed. Retrying on next phrase.', 'warning');
+        showToast(`Transcription failed: ${detail || 'server error'}.`, 'error');
       }
+
+      registerServerFailure();
       return;
     }
+
+    serverFailures = 0;
 
     const data = await res.json();
 
@@ -531,6 +538,7 @@ async function sendChunkForTranscription(blob) {
   } catch (err) {
     setErrorDiagnostic('Error: network');
     showToast('Network interruption while transcribing. Will continue.', 'warning');
+    registerServerFailure();
   } finally {
     pendingTranscriptions = Math.max(0, pendingTranscriptions - 1);
     if (pendingTranscriptions === 0) {
@@ -548,6 +556,30 @@ function setErrorDiagnostic(text) {
   dbgError.className = text === 'None'
     ? 'font-semibold text-slate-400 text-xs mt-0.5 truncate'
     : 'font-semibold text-rose-400 text-xs mt-0.5 truncate';
+}
+
+/** Pull a human-readable reason out of an upstream error payload. */
+function extractUpstreamMessage(info) {
+  if (!info || typeof info.detail !== 'string' || !info.detail) return '';
+  try {
+    const parsed = JSON.parse(info.detail);
+    const msg = parsed && parsed.error && parsed.error.message;
+    if (msg) return msg;
+  } catch (e) { /* detail was not JSON */ }
+  return info.detail.slice(0, 120);
+}
+
+/**
+ * If the server engine keeps failing, stop relying on it: the next Start
+ * falls back to the browser engine so the user is never left with an app
+ * that silently produces nothing.
+ */
+function registerServerFailure() {
+  serverFailures += 1;
+  if (serverFailures >= 2 && serverConfigured) {
+    serverConfigured = false;
+    showToast('Server transcription unavailable — browser engine will be used on next Start.', 'error');
+  }
 }
 
 async function startServerEngine() {
