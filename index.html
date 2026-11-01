@@ -187,31 +187,37 @@
           </div>
           <div>
             <h2 class="text-sm font-bold text-slate-900 dark:text-slate-100">On-Device Whisper Engine</h2>
-            <p class="text-[11px] text-slate-500 dark:text-slate-400">Runs fully inside your browser — no API key, no credits, no upload.</p>
+            <p class="text-[11px] text-slate-500 dark:text-slate-400">Runs 100% locally in your browser — zero API key, no data leaves your device.</p>
           </div>
         </div>
-        <button id="loadModelBtn" class="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 dark:bg-indigo-600 dark:hover:bg-indigo-500 active:scale-95 transition-all shadow-sm disabled:opacity-40 disabled:cursor-not-allowed">
+        <button id="loadModelBtn" class="flex items-center gap-1.5 px-4 py-2.5 sm:py-2 rounded-xl text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 dark:bg-indigo-600 dark:hover:bg-indigo-500 active:scale-95 transition-all shadow-sm disabled:opacity-40 disabled:cursor-not-allowed">
           <i data-lucide="download-cloud" class="w-3.5 h-3.5"></i>
           <span id="loadModelBtnText">Load Model</span>
         </button>
       </div>
 
+      <!-- Device Capability Banner (Auto-detected) -->
+      <div id="deviceCapabilityBanner" class="flex items-center gap-2.5 px-3.5 py-2 rounded-xl text-xs bg-indigo-50/70 dark:bg-indigo-950/30 border border-indigo-100 dark:border-indigo-900/50 text-indigo-900 dark:text-indigo-200">
+        <i id="deviceCapabilityIcon" data-lucide="smartphone" class="w-4 h-4 text-indigo-600 dark:text-indigo-400 flex-shrink-0"></i>
+        <span id="deviceCapabilityText" class="font-medium">Detecting device profile...</span>
+      </div>
+
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <label class="flex flex-col gap-1">
-          <span class="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">Model</span>
-          <select id="modelSelect" class="w-full px-3 py-2 rounded-xl text-xs font-medium bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
-            <option value="tiny">Whisper Tiny · ~40 MB · fastest</option>
-            <option value="base" selected>Whisper Base · ~80 MB · balanced</option>
-            <option value="small">Whisper Small · ~250 MB · better Malayalam &amp; Arabic</option>
-            <option value="turbo">Whisper Large v3 Turbo · ~800 MB · best (WebGPU)</option>
+          <span class="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">Model Selection</span>
+          <select id="modelSelect" class="w-full px-3 py-2.5 sm:py-2 rounded-xl text-xs font-medium bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
+            <option value="tiny">Whisper Tiny · ~40 MB · Recommended for Mobile &amp; Battery</option>
+            <option value="base" selected>Whisper Base · ~80 MB · Balanced (Default Desktop)</option>
+            <option value="small">Whisper Small · ~250 MB · Higher Malayalam &amp; Arabic Accuracy</option>
+            <option value="turbo">Whisper Large v3 Turbo · ~800 MB · Best Quality (Requires GPU)</option>
           </select>
         </label>
         <label class="flex flex-col gap-1">
-          <span class="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">Compute Backend</span>
-          <select id="deviceSelect" class="w-full px-3 py-2 rounded-xl text-xs font-medium bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
-            <option value="auto" selected>Auto (WebGPU when available)</option>
-            <option value="wasm">WebAssembly (CPU)</option>
-            <option value="webgpu">WebGPU (GPU accelerated)</option>
+          <span class="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">Compute Acceleration</span>
+          <select id="deviceSelect" class="w-full px-3 py-2.5 sm:py-2 rounded-xl text-xs font-medium bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/30">
+            <option value="auto" selected>Auto (WebGPU when available, CPU fallback)</option>
+            <option value="wasm">WebAssembly (CPU - Compatible everywhere)</option>
+            <option value="webgpu">WebGPU (Hardware GPU Accelerated)</option>
           </select>
         </label>
       </div>
@@ -221,13 +227,13 @@
           <span id="modelStatus" class="text-slate-500 dark:text-slate-400">Model not loaded yet.</span>
           <span id="modelPct" class="text-slate-500 dark:text-slate-400">0%</span>
         </div>
-        <div class="h-2 w-full bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+        <div class="h-2.5 w-full bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
           <div id="modelBar" class="h-full w-0 bg-gradient-to-r from-indigo-500 to-emerald-500 transition-all duration-200"></div>
         </div>
       </div>
 
       <p class="text-[11px] text-slate-400 dark:text-slate-500 leading-relaxed">
-        The first run downloads the model from the Hugging Face CDN and caches it in your browser. Larger models are more accurate but slower. Your audio is never uploaded anywhere.
+        The model is cached permanently in your browser via the Cache API. Once downloaded, it loads instantly and functions without internet.
       </p>
     </div>
 
@@ -332,8 +338,15 @@
           <i data-lucide="activity" class="w-4 h-4 text-emerald-400"></i>
           <span>Speech Engine Diagnostic Panel</span>
         </span>
-        <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-400">Live Debugger</span>
+        <div class="flex items-center gap-2">
+          <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-400 hidden sm:inline">Live Debugger</span>
+          <button id="toggleDebugBtn" class="text-[10px] px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors">
+            Collapse
+          </button>
+        </div>
       </div>
+
+      <div id="debugContent" class="flex flex-col gap-3">
 
       <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5 pt-1">
         <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
@@ -371,6 +384,7 @@
           <div class="text-slate-400 text-[10px] uppercase">Last Error / Notice</div>
           <div id="dbgError" class="font-semibold text-slate-400 text-xs mt-0.5 truncate">None</div>
         </div>
+      </div>
       </div>
     </div>
 

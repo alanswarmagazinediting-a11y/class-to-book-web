@@ -1,194 +1,118 @@
 /**
- * VoiceType – Live Multilingual Speech to Text
- *
- * ON-DEVICE WHISPER ENGINE
- * ---------------------------------------------------------------------------
- * Speech recognition runs ENTIRELY inside the browser:
- *
- *   microphone ─► AudioContext (16 kHz mono PCM)
- *                      │
- *                      ├─ adaptive voice-activity detection (VAD)
- *                      │
- *                      └─ disjoint phrase chunk, cut on real silence
- *                               │
- *                               ▼
- *                   Web Worker + transformers.js
- *                   (open-source Whisper ONNX via WebGPU / WebAssembly)
- *                               │
- *                               ▼
- *                   text in the ORIGINAL writing system
- *                   (Malayalam / العربية / English)
- *
- * There is no server, no API key, no credits and no upload: the audio never
- * leaves the device. The only network activity is downloading the model files
- * once from the public Hugging Face CDN (then they are cached by the browser).
- *
- * WHY WORDS ARE NEVER DUPLICATED
- * ---------------------------------------------------------------------------
- * - Audio chunks are DISJOINT. A chunk is closed at a real pause, and the very
- *   next sample starts the following chunk, so no audio is ever fed twice.
- * - Every chunk carries a unique id and is committed EXACTLY ONCE (the
- *   `committedSegmentIds` guard drops any repeat).
- * - The transcript is append-only and is never rebuilt from a cumulative
- *   result list.
- * - There is NO text-based duplicate filter, so genuine repetitions that the
- *   speaker really said are preserved.
- *
- * CONFIRMED vs TEMPORARY
- * ---------------------------------------------------------------------------
- * Confirmed text lives in the editable textarea. Text that is still being
- * decoded is streamed into the separate `interimStream` panel and is never
- * mixed into the editor.
+ * VoiceType – Live Speech to Text
+ * On-Device Whisper Multilingual Transcription Engine
+ * 
+ * Features:
+ * - 100% On-Device local Whisper model via Transformers.js (v3)
+ * - Zero API keys, zero paid services, no audio data leaves your device
+ * - WebGPU Hardware Acceleration on supported Desktop/Mobile
+ * - Robust CPU / WebAssembly (WASM) fallback
+ * - Device Capability Detection (Lightweight Tiny model on Mobile, Base on Desktop)
+ * - Three core languages: Malayalam (ml-IN), Arabic (ar-SA), English (en-US)
+ * - Automatic Language & Script detection with native writing systems
+ * - Start, Pause, Resume, Stop controls with session continuity
+ * - Zero Duplication: Disjoint audio chunking + unique segment ID registry
+ * - Editable textarea, Copy to clipboard, and .txt file download
+ * - Offline model caching via Cache API
  */
 
 // -------------------------------------------------------------
-// 0. Configuration
+// 0. Configuration & Registries
 // -------------------------------------------------------------
 
-// Transformer.js build used for on-device inference (open source, MIT).
 const TRANSFORMERS_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
 
-// Open-source Whisper models, converted to ONNX and published on the
-// Hugging Face Hub. Nothing here requires a key, an account or credits.
+// Open-source Multilingual Whisper models on Hugging Face Hub (ONNX)
 const MODEL_REGISTRY = {
-  tiny:  { id: 'onnx-community/whisper-tiny',             label: 'Whisper Tiny' },
-  base:  { id: 'onnx-community/whisper-base',             label: 'Whisper Base' },
-  small: { id: 'onnx-community/whisper-small',            label: 'Whisper Small' },
-  turbo: { id: 'onnx-community/whisper-large-v3-turbo',   label: 'Whisper Large v3 Turbo' }
+  tiny:  { id: 'onnx-community/whisper-tiny',           label: 'Whisper Tiny (~40 MB)',  sizeMb: 40,  tier: 'mobile' },
+  base:  { id: 'onnx-community/whisper-base',           label: 'Whisper Base (~80 MB)',  sizeMb: 80,  tier: 'balanced' },
+  small: { id: 'onnx-community/whisper-small',          label: 'Whisper Small (~250 MB)', sizeMb: 250, tier: 'accuracy' },
+  turbo: { id: 'onnx-community/whisper-large-v3-turbo', label: 'Whisper Large v3 Turbo (~800 MB)', sizeMb: 800, tier: 'gpu' }
 };
 
-// Supported Languages
+// Supported Languages Configuration
 const LANG_CONFIG = {
   MALAYALAM: { code: 'ml-IN', short: 'ml', name: 'Malayalam', badge: 'Primary', script: 'മലയാളം' },
   ARABIC:    { code: 'ar-SA', short: 'ar', name: 'Arabic',    badge: 'Secondary', script: 'العربية' },
   ENGLISH:   { code: 'en-US', short: 'en', name: 'English',   badge: 'Tertiary', script: 'English' }
 };
 
-// Script ranges used to label the language of a decoded phrase.
+// Regex patterns for script detection
 const SCRIPT_PATTERNS = {
   malayalam: /[\u0D00-\u0D7F]/,
   arabic:    /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/,
   english:   /[a-zA-Z]/
 };
 
-// Audio capture + voice-activity-detection tuning.
-// The speech gate is ADAPTIVE: it is derived from the measured room noise, so a
-// quiet microphone still registers speech instead of staying silent.
+// Audio capture + Voice Activity Detection (VAD) settings
 const AUDIO = {
-  SAMPLE_RATE: 16000,        // Whisper only accepts 16 kHz mono
-  FRAME_MS: 20,              // VAD resolution
-  PROCESSOR_BUFFER: 1024,    // ScriptProcessor window (~64 ms @16 kHz)
-  CALIBRATION_MS: 600,       // listen to the room before latching the gate
-  MIN_GATE: 0.0045,          // most sensitive gate we will ever use
-  NOISE_MULTIPLIER: 2.6,     // gate = max(MIN_GATE, noiseFloor * this)
-  MIN_SPEECH_MS: 160,        // voiced audio needed before a chunk opens
-  SILENCE_CLOSE_MS: 700,     // pause length that closes a phrase
-  TAIL_KEEP_MS: 180,         // silence kept at the end so no word is clipped
-  MIN_CHUNK_MS: 500,         // ignore blips shorter than this
-  MAX_CHUNK_MS: 14000,       // hard cap; Whisper's window is 30 s
-  PREROLL_MS: 320            // audio kept before speech onset
+  SAMPLE_RATE: 16000,        // 16 kHz mono PCM required by Whisper
+  FRAME_MS: 20,              // VAD evaluation frame resolution
+  PROCESSOR_BUFFER: 1024,    // ScriptProcessor window size (~64 ms)
+  CALIBRATION_MS: 600,       // Ambient room noise calibration duration
+  MIN_GATE: 0.0045,          // Minimum audio threshold gate
+  NOISE_MULTIPLIER: 2.6,     // Gate = max(MIN_GATE, noiseFloor * 2.6)
+  MIN_SPEECH_MS: 160,        // Voiced duration needed to trigger speech onset
+  SILENCE_CLOSE_MS: 700,     // Pause duration to cut a phrase chunk
+  TAIL_KEEP_MS: 180,         // Silence preserved at end of chunk to avoid clipping
+  MIN_CHUNK_MS: 450,         // Discard noise blips under 450 ms
+  MAX_CHUNK_MS: 12000,       // Maximum chunk length before forcing a cut
+  PREROLL_MS: 300            // Audio retained before speech onset
 };
 
 const FRAME_SIZE = Math.round((AUDIO.SAMPLE_RATE * AUDIO.FRAME_MS) / 1000);
 const PREROLL_FRAMES = Math.round(AUDIO.PREROLL_MS / AUDIO.FRAME_MS);
 const CALIBRATION_FRAMES = Math.round(AUDIO.CALIBRATION_MS / AUDIO.FRAME_MS);
 
-// RTL embedding marks so Arabic segments render right-to-left in a plain textarea
+// Unicode marks for proper RTL Arabic embedding in LTR contexts
 const RLE = '\u202B';
 const PDF = '\u202C';
 
 // -------------------------------------------------------------
-// 0b. ASR worker source (runs off the main thread)
+// 0b. ASR Worker Script Source (Runs off main UI thread)
 // -------------------------------------------------------------
 
 const ASR_WORKER_SOURCE = [
   "'use strict';",
   "",
-  "const CDN_URLS = [",
-  "  " + JSON.stringify(TRANSFORMERS_CDN) + ",",
-  "  " + JSON.stringify(TRANSFORMERS_CDN + "/dist/transformers.js"),
-  "];",
-  "",
+  "const CDN_URL = " + JSON.stringify(TRANSFORMERS_CDN) + ";",
   "let libPromise = null;",
   "",
   "function loadLibrary() {",
   "  if (!libPromise) {",
   "    libPromise = (async function () {",
-  "      let lastError = null;",
-  "      for (let i = 0; i < CDN_URLS.length; i++) {",
+  "      try {",
+  "        const mod = await import(CDN_URL);",
+  "        if (mod && typeof mod.pipeline === 'function') return mod;",
+  "      } catch (e1) {",
   "        try {",
-  "          const mod = await import(CDN_URLS[i]);",
-  "          if (mod && typeof mod.pipeline === 'function') return mod;",
-  "          lastError = new Error('transformers.js export missing at ' + CDN_URLS[i]);",
-  "        } catch (err) {",
-  "          lastError = err;",
+  "          const mod2 = await import(CDN_URL + '/dist/transformers.js');",
+  "          if (mod2 && typeof mod2.pipeline === 'function') return mod2;",
+  "        } catch (e2) {",
+  "          throw new Error('Failed to load Transformers.js from CDN: ' + (e2.message || e1.message));",
   "        }",
   "      }",
-  "      throw lastError || new Error('Could not load the inference library.');",
+  "      throw new Error('Transformers.js pipeline function not found.');",
   "    })();",
   "  }",
   "  return libPromise;",
   "}",
   "",
   "let transcriber = null;",
+  "let activeModelId = null;",
+  "let activeDevice = null;",
   "let chain = Promise.resolve();",
   "",
-  "function emit(message) { self.postMessage(message); }",
-  "function errText(err) { return (err && err.message) ? err.message : String(err); }",
-  "",
-  "// Whisper's own language-detection step. transformers.js does NOT do this for",
-  "// us: when no language is given it silently falls back to English (see its",
-  "// `_retrieve_init_tokens`). We therefore read the decoder logits that follow",
-  "// <|startoftranscript|> ourselves and pick the most likely language token.",
-  "// Candidates are limited to the three languages this app supports so the",
-  "// output is always written in one of the expected native scripts.",
-  "const TARGET_LANG_TOKENS = ['<|en|>', '<|ml|>', '<|ar|>'];",
-  "",
-  "async function detectLanguage(audio) {",
-  "  const mod = await loadLibrary();",
-  "  const model = transcriber && transcriber.model;",
-  "  const gc = model && model.generation_config;",
-  "  if (!gc || !gc.lang_to_id || gc.decoder_start_token_id == null) return null;",
-  "",
-  "  const candidates = [];",
-  "  for (let i = 0; i < TARGET_LANG_TOKENS.length; i++) {",
-  "    const token = TARGET_LANG_TOKENS[i];",
-  "    const id = gc.lang_to_id[token];",
-  "    if (typeof id === 'number') candidates.push({ code: token.slice(2, -2), id: id });",
-  "  }",
-  "  if (candidates.length === 0) return null;",
-  "",
-  "  // One encoder pass plus a single decoder step is all Whisper needs to",
-  "  // decide the language.",
-  "  const feature = await transcriber.processor(audio);",
-  "  const start = gc.decoder_start_token_id;",
-  "  const decoder_input_ids = new mod.Tensor('int64', BigInt64Array.from([BigInt(start)]), [1, 1]);",
-  "  const out = await model.forward({",
-  "    input_features: feature.input_features,",
-  "    decoder_input_ids: decoder_input_ids",
-  "  });",
-  "",
-  "  const logits = out && out.logits;",
-  "  if (!logits || !logits.data || !logits.dims) return null;",
-  "",
-  "  const vocab = logits.dims[logits.dims.length - 1];",
-  "  const base = logits.data.length - vocab;",
-  "  let best = -Infinity;",
-  "  let bestCode = null;",
-  "  for (let i = 0; i < candidates.length; i++) {",
-  "    const value = logits.data[base + candidates[i].id];",
-  "    if (typeof value === 'number' && value > best) {",
-  "      best = value;",
-  "      bestCode = candidates[i].code;",
-  "    }",
-  "  }",
-  "  return bestCode;",
-  "}",
+  "function emit(msg) { self.postMessage(msg); }",
+  "function errText(e) { return (e && e.message) ? e.message : String(e); }",
   "",
   "self.addEventListener('message', function (event) {",
   "  const data = event.data || {};",
-  "  if (data.type === 'load') chain = chain.then(function () { return doLoad(data); }, function () { return doLoad(data); });",
-  "  else if (data.type === 'transcribe') chain = chain.then(function () { return doTranscribe(data); }, function () { return doTranscribe(data); });",
+  "  if (data.type === 'load') {",
+  "    chain = chain.then(function () { return doLoad(data); }, function () { return doLoad(data); });",
+  "  } else if (data.type === 'transcribe') {",
+  "    chain = chain.then(function () { return doTranscribe(data); }, function () { return doTranscribe(data); });",
+  "  }",
   "});",
   "",
   "async function doLoad(data) {",
@@ -198,36 +122,87 @@ const ASR_WORKER_SOURCE = [
   "    env.allowLocalModels = false;",
   "    env.useBrowserCache = true;",
   "",
-  "    const order = data.device === 'wasm' ? ['wasm']",
-  "                : data.device === 'webgpu' ? ['webgpu', 'wasm']",
-  "                : ['webgpu', 'wasm'];",
-  "",
-  "    let lastError = null;",
-  "    for (let i = 0; i < order.length; i++) {",
-  "      const device = order[i];",
-  "      // Whisper is very sensitive to encoder quantisation, so the encoder is",
-  "      // kept at half precision on the GPU and 8-bit on the CPU.",
-  "      const dtype = device === 'webgpu'",
-  "        ? { encoder_model: 'fp16', decoder_model_merged: 'fp16' }",
-  "        : 'q8';",
+  "    // Probe if WebGPU is available in this worker context",
+  "    let hasWebGPU = false;",
+  "    if (typeof navigator !== 'undefined' && navigator.gpu) {",
   "      try {",
-  "        emit({ type: 'status', message: 'Loading weights on ' + device + '…' });",
-  "        transcriber = await mod.pipeline('automatic-speech-recognition', data.model, {",
-  "          device: device,",
-  "          dtype: dtype,",
-  "          progress_callback: function (p) { emit({ type: 'progress', payload: p }); }",
-  "        });",
-  "        lastError = null;",
-  "        break;",
-  "      } catch (err) {",
-  "        lastError = err;",
-  "        transcriber = null;",
-  "        emit({ type: 'status', message: 'Backend ' + device + ' unavailable — trying the next one…' });",
+  "        const adapter = await navigator.gpu.requestAdapter();",
+  "        if (adapter) hasWebGPU = true;",
+  "      } catch (gpuErr) {",
+  "        hasWebGPU = false;",
   "      }",
   "    }",
   "",
-  "    if (!transcriber) throw (lastError || new Error('The model could not be loaded.'));",
-  "    emit({ type: 'loaded', device: transcriber.model && transcriber.model.device ? transcriber.model.device : order[0] });",
+  "    const requestedBackend = data.device || 'auto';",
+  "    const candidates = [];",
+  "",
+  "    // 1. WebGPU candidates if supported or explicitly requested",
+  "    if (requestedBackend === 'webgpu' || (requestedBackend === 'auto' && hasWebGPU)) {",
+  "      candidates.push({",
+  "        device: 'webgpu',",
+  "        dtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' },",
+  "        label: 'WebGPU (Hardware GPU Accelerated)'",
+  "      });",
+  "      candidates.push({",
+  "        device: 'webgpu',",
+  "        dtype: 'q4',",
+  "        label: 'WebGPU (Q4 Quantized)'",
+  "      });",
+  "    }",
+  "",
+  "    // 2. WebAssembly CPU fallbacks (universal compatibility on Desktop & Mobile)",
+  "    candidates.push({",
+  "      device: 'wasm',",
+  "      dtype: 'q4',",
+  "      label: 'WebAssembly (CPU Q4 - Memory Efficient)'",
+  "    });",
+  "    candidates.push({",
+  "      device: 'wasm',",
+  "      dtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' },",
+  "      label: 'WebAssembly (CPU FP32/Q4)'",
+  "    });",
+  "    candidates.push({",
+  "      device: 'wasm',",
+  "      dtype: 'fp32',",
+  "      label: 'WebAssembly (CPU Standard)'",
+  "    });",
+  "",
+  "    let lastError = null;",
+  "    let loadedConfig = null;",
+  "",
+  "    for (let i = 0; i < candidates.length; i++) {",
+  "      const c = candidates[i];",
+  "      try {",
+  "        emit({ type: 'status', message: 'Initializing weights on ' + c.label + '…' });",
+  "        transcriber = await mod.pipeline('automatic-speech-recognition', data.model, {",
+  "          device: c.device,",
+  "          dtype: c.dtype,",
+  "          progress_callback: function (p) {",
+  "            emit({ type: 'progress', payload: p });",
+  "          }",
+  "        });",
+  "        loadedConfig = c;",
+  "        lastError = null;",
+  "        break; // Pipeline initialized successfully!",
+  "      } catch (cErr) {",
+  "        lastError = cErr;",
+  "        transcriber = null;",
+  "        emit({ type: 'status', message: c.label + ' unavailable: ' + errText(cErr) + '. Trying fallback…' });",
+  "      }",
+  "    }",
+  "",
+  "    if (!transcriber) {",
+  "      throw (lastError || new Error('Unable to initialize speech recognition on any device backend.'));",
+  "    }",
+  "",
+  "    activeModelId = data.model;",
+  "    activeDevice = loadedConfig.device;",
+  "    emit({",
+  "      type: 'loaded',",
+  "      model: data.model,",
+  "      device: loadedConfig.device,",
+  "      description: loadedConfig.label",
+  "    });",
   "  } catch (err) {",
   "    emit({ type: 'error', scope: 'load', message: errText(err) });",
   "  }",
@@ -235,59 +210,61 @@ const ASR_WORKER_SOURCE = [
   "",
   "async function doTranscribe(data) {",
   "  if (!transcriber) {",
-  "    emit({ type: 'error', scope: 'transcribe', id: data.id, message: 'The model is not loaded yet.' });",
+  "    emit({ type: 'error', scope: 'transcribe', id: data.id, message: 'Whisper model is not loaded.' });",
   "    return;",
   "  }",
   "",
   "  try {",
-  "    // Manual language hint wins; otherwise let Whisper identify the language",
-  "    // of this chunk so mixed-language speech is handled chunk by chunk.",
-  "    let language = data.language || null;",
-  "    if (!language) {",
-  "      try {",
-  "        language = await detectLanguage(data.audio);",
-  "      } catch (detectError) {",
-  "        language = null;",
-  "      }",
+  "    const options = {",
+  "      task: 'transcribe',",
+  "      return_timestamps: false",
+  "    };",
+  "    if (data.language) {",
+  "      options.language = data.language;",
   "    }",
   "",
-  "    const options = { task: 'transcribe' };",
-  "    if (language) options.language = language;",
-  "",
-  "    // Stream decoded tokens so the UI can show a temporary transcript.",
+  "    // Optional interim token streamer for real-time visual typing feedback",
   "    try {",
   "      const mod = await loadLibrary();",
   "      if (mod.TextStreamer && transcriber.tokenizer) {",
-  "        let acc = '';",
+  "        let accumulated = '';",
   "        options.streamer = new mod.TextStreamer(transcriber.tokenizer, {",
   "          skip_prompt: true,",
   "          skip_special_tokens: true,",
   "          callback_function: function (token) {",
-  "            acc += token;",
-  "            emit({ type: 'partial', id: data.id, text: acc });",
+  "            accumulated += token;",
+  "            emit({ type: 'partial', id: data.id, text: accumulated });",
   "          }",
   "        });",
   "      }",
-  "    } catch (streamError) {",
+  "    } catch (sErr) {",
   "      delete options.streamer;",
   "    }",
   "",
   "    let output = null;",
   "    try {",
   "      output = await transcriber(data.audio, options);",
-  "    } catch (firstError) {",
-  "      if (!options.streamer) throw firstError;",
-  "      // Retry once without streaming — a streamer problem must not lose audio.",
-  "      delete options.streamer;",
-  "      output = await transcriber(data.audio, options);",
+  "    } catch (runErr) {",
+  "      // Fallback: retry once without streamer if it was an issue",
+  "      if (options.streamer) {",
+  "        delete options.streamer;",
+  "        output = await transcriber(data.audio, options);",
+  "      } else {",
+  "        throw runErr;",
+  "      }",
   "    }",
   "",
-  "    emit({ type: 'result', id: data.id, language: language, text: (output && output.text) ? output.text : '' });",
+  "    const text = (output && typeof output.text === 'string') ? output.text.trim() : '';",
+  "    emit({",
+  "      type: 'result',",
+  "      id: data.id,",
+  "      text: text,",
+  "      language: data.language || null",
+  "    });",
   "  } catch (err) {",
   "    emit({ type: 'error', scope: 'transcribe', id: data.id, message: errText(err) });",
   "  }",
-  "}",
-  ""
+  "}"
 ].join('\n');
 
 // -------------------------------------------------------------
@@ -296,21 +273,21 @@ const ASR_WORKER_SOURCE = [
 
 let appState = 'idle';           // 'idle' | 'recording' | 'paused' | 'stopped'
 let activeMode = 'auto';         // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
-let currentLangCode = 'ml-IN';
+let currentLangCode = 'ml-IN';   // Primary default is Malayalam
 let detectedLang = LANG_CONFIG.MALAYALAM;
 
-// Append-only transcript model (the editor is the single source of truth)
+// Single Source of Truth for confirmed text in editor
 let finalTranscript = '';
 
-// Segment store — each committed segment is recorded once, by unique id.
+// Unique Segment Registry: GUARANTEES zero duplicate segments
 let segmentCounter = 0;
 const committedSegmentIds = new Set();
-const committedSegments = [];    // { id, lang, text }
+const committedSegments = [];
 
-// Bumped by "Clear Text" so in-flight decodes cannot repopulate a cleared editor.
+// Incremented on "Clear Text" to invalidate in-flight chunk decodes
 let transcriptGeneration = 0;
 
-// On-device engine state
+// On-Device Engine State
 let asrWorker = null;
 let modelReady = false;
 let modelLoading = false;
@@ -321,14 +298,14 @@ let modelLoadResolve = null;
 let pendingModelLoad = null;
 const modelFileProgress = new Map();
 
-// Transcription queue (one decode at a time, in capture order)
+// Transcription Queue (FIFO order, 1 active chunk decode at a time)
 const transcriptionQueue = [];
 let activeJob = null;
 let partialText = '';
 let segmentsDone = 0;
 let segmentsQueued = 0;
 
-// Microphone / audio graph
+// Audio Capture & Graph Nodes
 let micStream = null;
 let audioContext = null;
 let sourceNode = null;
@@ -336,7 +313,7 @@ let processorNode = null;
 let muteNode = null;
 let captureSampleRate = AUDIO.SAMPLE_RATE;
 
-// VAD + chunk assembly
+// Voice Activity Detection (VAD) & Frame Assembly State
 let noiseFloor = null;
 let noiseSamples = [];
 let prerollFrames = [];
@@ -350,6 +327,9 @@ let lastLevelUiAt = 0;
 // Timer State
 let timerInterval = null;
 let elapsedSeconds = 0;
+
+// Device Profile State
+let deviceProfile = null;
 
 // -------------------------------------------------------------
 // 2. DOM Elements
@@ -393,7 +373,7 @@ const toastMsg = document.getElementById('toastMsg');
 const toastIcon = document.getElementById('toastIcon');
 const unsupportedAlert = document.getElementById('unsupportedAlert');
 
-// On-device engine card
+// Engine Card Elements
 const loadModelBtn = document.getElementById('loadModelBtn');
 const loadModelBtnText = document.getElementById('loadModelBtnText');
 const modelSelect = document.getElementById('modelSelect');
@@ -401,8 +381,14 @@ const deviceSelect = document.getElementById('deviceSelect');
 const modelStatus = document.getElementById('modelStatus');
 const modelPct = document.getElementById('modelPct');
 const modelBar = document.getElementById('modelBar');
+const deviceCapabilityBanner = document.getElementById('deviceCapabilityBanner');
+const deviceCapabilityIcon = document.getElementById('deviceCapabilityIcon');
+const deviceCapabilityText = document.getElementById('deviceCapabilityText');
 
-// Diagnostic elements
+// Diagnostic Panel Elements
+const debugPanel = document.getElementById('debugPanel');
+const debugContent = document.getElementById('debugContent');
+const toggleDebugBtn = document.getElementById('toggleDebugBtn');
 const dbgSupported = document.getElementById('dbgSupported');
 const dbgMicPerm = document.getElementById('dbgMicPerm');
 const dbgStarted = document.getElementById('dbgStarted');
@@ -440,11 +426,57 @@ function showToast(message, type = 'success') {
   if (window.lucide) lucide.createIcons();
 
   toast.classList.add('show');
-  toastTimeout = setTimeout(() => toast.classList.remove('show'), 2800);
+  toastTimeout = setTimeout(() => toast.classList.remove('show'), 3000);
 }
 
 // -------------------------------------------------------------
-// 4. Interim / progress indicator (the TEMPORARY transcript)
+// 4. Device Capability & Mobile Detection
+// -------------------------------------------------------------
+
+function detectDeviceCapabilities() {
+  const ua = navigator.userAgent || '';
+  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua) ||
+    (navigator.maxTouchPoints && navigator.maxTouchPoints > 2 && window.innerWidth <= 850);
+
+  const hasWebGPU = Boolean(typeof navigator !== 'undefined' && navigator.gpu);
+  const cores = navigator.hardwareConcurrency || 4;
+  const memoryGB = navigator.deviceMemory || (isMobile ? 4 : 8);
+
+  return {
+    isMobile,
+    hasWebGPU,
+    cores,
+    memoryGB,
+    recommendedModel: isMobile ? 'tiny' : 'base'
+  };
+}
+
+function applyDeviceProfile() {
+  deviceProfile = detectDeviceCapabilities();
+
+  // If on mobile device, configure appropriate lightweight defaults
+  if (deviceProfile.isMobile) {
+    if (modelSelect) modelSelect.value = 'tiny';
+    if (deviceCapabilityText && deviceCapabilityIcon) {
+      deviceCapabilityIcon.setAttribute('data-lucide', 'smartphone');
+      deviceCapabilityText.textContent = `Mobile device detected (${deviceProfile.cores} cores) · Whisper Tiny (~40 MB) selected for low memory and battery saving.`;
+    }
+  } else {
+    if (deviceCapabilityText && deviceCapabilityIcon) {
+      if (deviceProfile.hasWebGPU) {
+        deviceCapabilityIcon.setAttribute('data-lucide', 'zap');
+        deviceCapabilityText.textContent = `Desktop detected · WebGPU hardware acceleration supported for ultra-fast transcription.`;
+      } else {
+        deviceCapabilityIcon.setAttribute('data-lucide', 'monitor');
+        deviceCapabilityText.textContent = `Desktop detected (${deviceProfile.cores} cores) · WebAssembly CPU mode with memory-efficient quantization ready.`;
+      }
+    }
+  }
+  if (window.lucide) lucide.createIcons();
+}
+
+// -------------------------------------------------------------
+// 5. Interim & Speech Stream Visuals
 // -------------------------------------------------------------
 
 function showInterim(text) {
@@ -460,7 +492,6 @@ function hideInterim() {
   interimStream.classList.add('hidden');
 }
 
-/** Repaint the temporary-transcript panel from the current engine state. */
 function updateInterimState() {
   const pending = transcriptionQueue.length + (activeJob ? 1 : 0);
 
@@ -470,23 +501,23 @@ function updateInterimState() {
   }
   if (activeJob) {
     showInterim(pending > 1
-      ? `⏳ Transcribing ${segmentsDone + 1} of ${segmentsDone + pending} segments…`
-      : '⏳ Transcribing…');
+      ? `⏳ Transcribing segment ${segmentsDone + 1} of ${segmentsDone + pending}…`
+      : '⏳ Transcribing spoken audio…');
     return;
   }
   if (speechActive) {
-    showInterim('🎙 Capturing speech…');
+    showInterim('🎙️ Capturing speech…');
     return;
   }
   if (appState === 'recording') {
-    showInterim('🎙 Listening…');
+    showInterim('🎙️ Listening for voice…');
     return;
   }
   hideInterim();
 }
 
 // -------------------------------------------------------------
-// 5. Microphone Permission & Browser Support
+// 6. Microphone Permissions & Support Check
 // -------------------------------------------------------------
 
 async function checkMicrophonePermission() {
@@ -520,22 +551,18 @@ function updateMicPermissionUI(state) {
 function detectEngineSupport() {
   const hasWebAssembly = typeof WebAssembly === 'object' && typeof WebAssembly.instantiate === 'function';
   const hasWorker = typeof Worker === 'function';
-  const hasWebGPU = typeof navigator !== 'undefined' && Boolean(navigator.gpu);
   const hasAudio = Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  const hasWebGPU = typeof navigator !== 'undefined' && Boolean(navigator.gpu);
   return {
     ok: hasWebAssembly && hasWorker && hasAudio,
-    hasWebGPU: hasWebGPU
+    hasWebGPU
   };
 }
 
 // -------------------------------------------------------------
-// 6. Language Helpers
+// 7. Script & Language Classification
 // -------------------------------------------------------------
 
-/**
- * Whisper returns the phrase in its own writing system, so the language can be
- * labelled reliably from the script that is actually present in the text.
- */
 function classifyText(text) {
   if (!text || !text.trim()) return null;
   if (SCRIPT_PATTERNS.arabic.test(text)) return LANG_CONFIG.ARABIC;
@@ -568,7 +595,7 @@ function updateLanguageUI(langObj) {
 }
 
 // -------------------------------------------------------------
-// 7. Segment Store — commit each decoded segment EXACTLY ONCE
+// 8. Segment Registry (ZERO DUPLICATION GUARANTEE)
 // -------------------------------------------------------------
 
 function makeSegmentId(prefix) {
@@ -576,7 +603,6 @@ function makeSegmentId(prefix) {
   return `${prefix}-${segmentCounter}-${Date.now()}`;
 }
 
-/** Append text to the transcript with correct spacing / sentence breaks. */
 function appendToTranscript(text) {
   const clean = text.trim();
   if (!clean) return;
@@ -584,8 +610,7 @@ function appendToTranscript(text) {
   let out = finalTranscript;
 
   if (out.length > 0 && !/\s$/.test(out)) {
-    // Add a space so words never fuse; add a sentence break after terminal
-    // punctuation so distinct sentences stay readable.
+    // Add appropriate spacing or line-break based on punctuation
     out += /[.!?।؟]$/.test(out.trim()) ? '\n' : ' ';
   }
 
@@ -595,17 +620,16 @@ function appendToTranscript(text) {
   textEditor.scrollTop = textEditor.scrollHeight;
 }
 
-/**
- * Commit a decoded segment once. Duplicate ids are ignored, so a segment can
- * never be written to the transcript twice.
- * NOTE: no text-based filtering — intentional repetitions are preserved.
- */
 function commitSegment(langCode, text, providedId) {
   const id = providedId || makeSegmentId('seg');
+  
+  // Guard: if this exact segment id has already been committed, drop it!
   if (committedSegmentIds.has(id)) return false;
   if (!text || !text.trim()) return false;
 
   const langObj = Object.values(LANG_CONFIG).find(l => l.code === langCode) || detectedLang;
+  
+  // Arabic RTL formatting
   const rendered = langObj.code === LANG_CONFIG.ARABIC.code ? RLE + text.trim() + PDF : text.trim();
 
   committedSegmentIds.add(id);
@@ -613,8 +637,9 @@ function commitSegment(langCode, text, providedId) {
 
   appendToTranscript(rendered);
 
-  // Language indicator follows the language actually used for this segment.
-  if (langObj.code !== detectedLang.code) updateLanguageUI(langObj);
+  if (langObj.code !== detectedLang.code) {
+    updateLanguageUI(langObj);
+  }
 
   recordSegmentDiagnostic();
   return true;
@@ -634,7 +659,7 @@ function clearSegments() {
 }
 
 // -------------------------------------------------------------
-// 8. Diagnostics helpers
+// 9. Diagnostics Helpers
 // -------------------------------------------------------------
 
 function setErrorDiagnostic(text) {
@@ -645,7 +670,6 @@ function setErrorDiagnostic(text) {
     : 'font-semibold text-rose-400 text-xs mt-0.5 truncate';
 }
 
-/** Live mic-level readout so "it can't hear me" is diagnosable at a glance. */
 function updateLevelDiagnostic(rms, gate, calibrating) {
   if (!dbgSpeech) return;
   const now = Date.now();
@@ -654,7 +678,7 @@ function updateLevelDiagnostic(rms, gate, calibrating) {
 
   if (rms > gate) {
     dbgSpeech.textContent = calibrating
-      ? 'Calibrating…'
+      ? 'Calibrating mic…'
       : `Speech Detected (${rms.toFixed(3)} > ${gate.toFixed(3)})`;
     dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5';
   } else {
@@ -666,17 +690,17 @@ function updateLevelDiagnostic(rms, gate, calibrating) {
 }
 
 // -------------------------------------------------------------
-// 9. Model loading (download progress)
+// 10. Model Loading & Download Progress Tracking
 // -------------------------------------------------------------
 
-function setModelProgress(percent, statusText, isError) {
+function setModelProgress(percent, statusText, isError = false) {
   const pct = Math.max(0, Math.min(100, Math.round(percent || 0)));
   if (modelBar) modelBar.style.width = pct + '%';
   if (modelPct) modelPct.textContent = pct + '%';
   if (modelStatus) {
     modelStatus.textContent = statusText;
     modelStatus.className = isError
-      ? 'text-rose-500 dark:text-rose-400'
+      ? 'text-rose-500 dark:text-rose-400 font-semibold'
       : 'text-slate-500 dark:text-slate-400';
   }
 }
@@ -689,8 +713,8 @@ function ensureWorker() {
   asrWorker = new Worker(url, { type: 'module' });
   asrWorker.onmessage = handleWorkerMessage;
   asrWorker.onerror = (event) => {
-    setErrorDiagnostic('Worker error: ' + (event.message || 'unknown'));
-    setModelProgress(0, 'Inference worker failed to start.', true);
+    setErrorDiagnostic('Worker error: ' + (event.message || 'script execution failed'));
+    setModelProgress(0, 'Inference worker could not start.', true);
     modelLoading = false;
     modelReady = false;
     loadModelBtn.disabled = false;
@@ -702,7 +726,6 @@ function ensureWorker() {
 
 function onModelFileProgress(payload) {
   if (!payload) return;
-
   if (payload.status === 'ready') return;
 
   if (payload.file) {
@@ -721,18 +744,22 @@ function onModelFileProgress(payload) {
 
   let loaded = 0;
   let total = 0;
-  modelFileProgress.forEach((entry) => { loaded += entry.loaded; total += entry.total; });
+  modelFileProgress.forEach((entry) => {
+    loaded += entry.loaded;
+    total += entry.total;
+  });
 
   if (total > 0) {
-    const mb = (value) => (value / 1048576).toFixed(1);
-    setModelProgress((loaded / total) * 100, `Downloading ${mb(loaded)} MB / ${mb(total)} MB…`);
+    const mb = (v) => (v / 1048576).toFixed(1);
+    const pct = Math.min(99, Math.round((loaded / total) * 100));
+    setModelProgress(pct, `Downloading model weights: ${mb(loaded)} MB / ${mb(total)} MB (${pct}%)…`);
   }
 }
 
-function loadModel(force) {
+function loadModel(force = false) {
   if (pendingModelLoad) return pendingModelLoad;
 
-  const key = modelSelect ? modelSelect.value : 'base';
+  const key = modelSelect ? modelSelect.value : (deviceProfile && deviceProfile.isMobile ? 'tiny' : 'base');
   const spec = MODEL_REGISTRY[key];
   if (!spec) return Promise.resolve(false);
   if (modelReady && loadedModelKey === key && !force) return Promise.resolve(true);
@@ -750,8 +777,8 @@ function loadModel(force) {
   } catch (err) {
     loadModelBtn.disabled = false;
     loadModelBtnText.textContent = 'Load Model';
-    setModelProgress(0, 'This browser cannot start the inference worker.', true);
-    showToast('This browser cannot run the on-device model. Use Chrome or Edge.', 'error');
+    setModelProgress(0, 'Inference worker unavailable in this browser.', true);
+    showToast('Cannot initialize inference worker. Please use Google Chrome or Microsoft Edge.', 'error');
     return Promise.resolve(false);
   }
 
@@ -785,12 +812,13 @@ function handleWorkerMessage(event) {
     modelReady = true;
     modelLoading = false;
     loadedModelKey = pendingModelKey;
-    loadedDeviceLabel = msg.device === 'webgpu' ? 'WebGPU (GPU)' : 'WebAssembly (CPU)';
+    loadedDeviceLabel = msg.description || (msg.device === 'webgpu' ? 'WebGPU (Hardware GPU)' : 'WebAssembly (CPU)');
     const spec = MODEL_REGISTRY[loadedModelKey] || { label: 'Whisper' };
+
     loadModelBtn.disabled = false;
-    loadModelBtnText.textContent = 'Model Ready';
+    loadModelBtnText.textContent = 'Model Loaded ✓';
     setModelProgress(100, `${spec.label} ready · ${loadedDeviceLabel}`);
-    showToast(`${spec.label} loaded on ${loadedDeviceLabel}. Press Start and speak.`, 'success');
+    showToast(`${spec.label} loaded on ${msg.device === 'webgpu' ? 'WebGPU (GPU)' : 'CPU (WebAssembly)'}. Click Start to speak.`, 'success');
     resolveModelLoad(true);
     pumpQueue();
     return;
@@ -815,9 +843,9 @@ function handleWorkerMessage(event) {
       modelReady = false;
       loadModelBtn.disabled = false;
       loadModelBtnText.textContent = 'Load Model';
-      setModelProgress(0, 'Model load failed.', true);
+      setModelProgress(0, 'Model load notice: ' + msg.message, true);
       setErrorDiagnostic('Error: ' + msg.message);
-      showToast('Could not load the model: ' + msg.message, 'error');
+      showToast('Model loading error: ' + msg.message, 'error');
       resolveModelLoad(false);
     } else {
       onTranscribeError(msg);
@@ -839,7 +867,7 @@ function resolveModelLoad(value) {
 }
 
 // -------------------------------------------------------------
-// 10. Transcription queue (one decode at a time, in capture order)
+// 11. Transcription Queue (FIFO, One Active Decode at a Time)
 // -------------------------------------------------------------
 
 function enqueueChunk(samples, durationMs) {
@@ -860,14 +888,19 @@ function pumpQueue() {
   updateInterimState();
 
   try {
+    let langHint = null;
+    if (activeMode !== 'auto') {
+      langHint = activeMode.split('-')[0]; // 'ml', 'ar', or 'en'
+    }
+
     asrWorker.postMessage({
       type: 'transcribe',
       id: activeJob.id,
       audio: activeJob.samples,
-      language: activeMode === 'auto' ? null : activeMode.split('-')[0]
+      language: langHint
     }, [activeJob.samples.buffer]);
   } catch (err) {
-    setErrorDiagnostic('Error: ' + (err && err.message ? err.message : 'post failed'));
+    setErrorDiagnostic('Error: ' + (err && err.message ? err.message : 'postMessage failed'));
     activeJob = null;
     pumpQueue();
   }
@@ -881,12 +914,13 @@ function onTranscribeResult(msg) {
   if (job && msg.id === job.id) {
     segmentsDone += 1;
     if (job.generation === transcriptGeneration && msg.text) {
-      // The script actually present in the text is checked first; the language
-      // Whisper detected is used when the text alone is ambiguous.
+      // Script classification from native characters
+      const classified = classifyText(msg.text);
       const reported = msg.language
         ? Object.values(LANG_CONFIG).find((l) => l.short === msg.language)
         : null;
-      const langObj = classifyText(msg.text) || reported || detectedLang;
+      const langObj = classified || reported || detectedLang;
+      
       commitSegment(langObj.code, msg.text, job.id);
     }
   }
@@ -899,14 +933,13 @@ function onTranscribeError(msg) {
   activeJob = null;
   partialText = '';
   segmentsDone += 1;
-  setErrorDiagnostic('Error: ' + msg.message);
-  showToast('A segment could not be transcribed. Continuing.', 'warning');
+  setErrorDiagnostic('Notice: ' + msg.message);
   updateInterimState();
   pumpQueue();
 }
 
 // -------------------------------------------------------------
-// 11. Audio capture — 16 kHz mono PCM + adaptive VAD chunking
+// 12. Audio Capture & Adaptive VAD Chunking
 // -------------------------------------------------------------
 
 function resetVadState() {
@@ -964,7 +997,7 @@ function processFrame(frame) {
   }
   const rms = Math.sqrt(sum / frame.length);
 
-  // Phase 1 — measure the room so the gate matches this microphone.
+  // Calibrate background noise floor
   if (noiseFloor === null) {
     noiseSamples.push(rms);
     if (noiseSamples.length >= CALIBRATION_FRAMES) {
@@ -982,7 +1015,6 @@ function processFrame(frame) {
   const voiced = rms > gate;
   updateLevelDiagnostic(rms, gate, noiseFloor === null);
 
-  // Phase 2 — build a chunk only around actual speech.
   if (!speechActive) {
     prerollFrames.push(frame.slice());
     if (prerollFrames.length > PREROLL_FRAMES) prerollFrames.shift();
@@ -991,7 +1023,7 @@ function processFrame(frame) {
 
     if (onsetMs >= AUDIO.MIN_SPEECH_MS) {
       speechActive = true;
-      chunkFrames = prerollFrames;   // keeps the audio captured just before onset
+      chunkFrames = prerollFrames;
       prerollFrames = [];
       silenceMs = 0;
       updateInterimState();
@@ -1008,12 +1040,6 @@ function processFrame(frame) {
   if (closedOnPause || chunkMs >= AUDIO.MAX_CHUNK_MS) closeChunk();
 }
 
-/**
- * Turn the frames collected so far into one DISJOINT chunk of 16 kHz mono
- * audio. Trailing silence is trimmed but a little is kept so the final word is
- * never clipped. Silence-only audio is discarded rather than sent to Whisper
- * (Whisper invents words when it is fed pure silence).
- */
 function closeChunk() {
   const frames = chunkFrames;
   const trailingSilence = silenceMs;
@@ -1046,11 +1072,16 @@ function closeChunk() {
 async function startCapture() {
   try {
     micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1
+      }
     });
   } catch (err) {
     updateMicPermissionUI('denied');
-    showToast('Microphone access blocked. Allow it in the address bar and try again.', 'error');
+    showToast('Microphone access denied. Please click the lock icon in the URL bar and allow microphone permissions.', 'error');
     return false;
   }
 
@@ -1063,7 +1094,7 @@ async function startCapture() {
     audioContext = new AudioCtx();
   }
   if (audioContext.state === 'suspended') {
-    try { await audioContext.resume(); } catch (err) { /* resumed by the gesture */ }
+    try { await audioContext.resume(); } catch (err) { /* resumed by click */ }
   }
   captureSampleRate = audioContext.sampleRate || AUDIO.SAMPLE_RATE;
 
@@ -1072,8 +1103,6 @@ async function startCapture() {
   processorNode.onaudioprocess = onAudioProcess;
   sourceNode.connect(processorNode);
 
-  // ScriptProcessor only runs when connected to the output; the gain node keeps
-  // it silent so nothing is played back through the speakers.
   muteNode = audioContext.createGain();
   muteNode.gain.value = 0;
   processorNode.connect(muteNode);
@@ -1081,23 +1110,29 @@ async function startCapture() {
 
   resetVadState();
 
-  if (dbgAudio) { dbgAudio.textContent = `Yes (${Math.round(captureSampleRate / 1000)} kHz PCM → 16 kHz)`; dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
-  if (dbgStarted) { dbgStarted.textContent = 'Capturing…'; dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
+  if (dbgAudio) {
+    dbgAudio.textContent = `Yes (${Math.round(captureSampleRate / 1000)} kHz PCM)`;
+    dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+  }
+  if (dbgStarted) {
+    dbgStarted.textContent = 'Listening';
+    dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+  }
   return true;
 }
 
 function stopCapture() {
   if (processorNode) {
     processorNode.onaudioprocess = null;
-    try { processorNode.disconnect(); } catch (err) { /* noop */ }
+    try { processorNode.disconnect(); } catch (err) {}
     processorNode = null;
   }
   if (sourceNode) {
-    try { sourceNode.disconnect(); } catch (err) { /* noop */ }
+    try { sourceNode.disconnect(); } catch (err) {}
     sourceNode = null;
   }
   if (muteNode) {
-    try { muteNode.disconnect(); } catch (err) { /* noop */ }
+    try { muteNode.disconnect(); } catch (err) {}
     muteNode = null;
   }
   if (micStream) {
@@ -1105,35 +1140,40 @@ function stopCapture() {
     micStream = null;
   }
   if (audioContext && audioContext.state !== 'closed') {
-    try { audioContext.close(); } catch (err) { /* noop */ }
+    try { audioContext.close(); } catch (err) {}
   }
   audioContext = null;
 
   resetVadState();
 
-  if (dbgAudio) { dbgAudio.textContent = 'No'; dbgAudio.className = 'font-bold text-slate-400 text-xs mt-0.5'; }
-  if (dbgStarted) { dbgStarted.textContent = 'Idle'; dbgStarted.className = 'font-bold text-slate-400 text-xs mt-0.5'; }
+  if (dbgAudio) {
+    dbgAudio.textContent = 'No';
+    dbgAudio.className = 'font-bold text-slate-400 text-xs mt-0.5';
+  }
+  if (dbgStarted) {
+    dbgStarted.textContent = 'Idle';
+    dbgStarted.className = 'font-bold text-slate-400 text-xs mt-0.5';
+  }
 }
 
-/** Close whatever phrase is in progress so a pause never loses speech. */
 function flushPendingAudio() {
   if (speechActive) closeChunk();
 }
 
 // -------------------------------------------------------------
-// 12. Session Controls
+// 13. Session Controls (Start, Pause, Resume, Stop)
 // -------------------------------------------------------------
 
 async function ensureModelForSession() {
-  const key = modelSelect ? modelSelect.value : 'base';
+  const key = modelSelect ? modelSelect.value : (deviceProfile && deviceProfile.isMobile ? 'tiny' : 'base');
   if (modelReady && loadedModelKey === key) return true;
 
   if (modelLoading) {
-    showToast('The model is still loading — one moment…', 'warning');
+    showToast('The Whisper model is still loading — one moment…', 'warning');
     return false;
   }
 
-  showToast('Downloading the on-device Whisper model…', 'info');
+  showToast('Loading Whisper model for local transcription…', 'info');
   return await loadModel();
 }
 
@@ -1145,7 +1185,7 @@ async function startSession() {
   if (!support.ok) {
     if (unsupportedAlert) unsupportedAlert.classList.remove('hidden');
     updateStatus('unsupported');
-    showToast('This browser cannot run the on-device engine. Use Chrome or Edge.', 'error');
+    showToast('Browser does not support on-device WebAssembly/Worker audio processing. Use Chrome or Edge.', 'error');
     return;
   }
 
@@ -1160,7 +1200,7 @@ async function startSession() {
   updateStatus('listening');
   startTimer();
   updateInterimState();
-  showToast('Listening on your device — Whisper detects the language automatically.', 'info');
+  showToast('Microphone active. Whisper is transcribing live on your device.', 'info');
 }
 
 function pauseSession() {
@@ -1174,7 +1214,7 @@ function pauseSession() {
   updateStatus('paused');
   updateControls();
   updateInterimState();
-  showToast('Paused. Your text is preserved.', 'info');
+  showToast('Recording paused. Text preserved.', 'info');
 }
 
 async function resumeSession() {
@@ -1190,7 +1230,7 @@ async function resumeSession() {
   updateStatus('listening');
   startTimer();
   updateInterimState();
-  showToast('Resumed — listening.', 'info');
+  showToast('Resumed recording.', 'info');
 }
 
 function stopSession() {
@@ -1206,11 +1246,11 @@ function stopSession() {
   updateStatus('stopped');
   updateControls();
   updateInterimState();
-  showToast('Recording stopped. Remaining audio is still being transcribed.', 'info');
+  showToast('Recording stopped. In-flight audio segments are finishing transcription.', 'info');
 }
 
 // -------------------------------------------------------------
-// 13. Controls & Status
+// 14. UI Controls & Status Badges
 // -------------------------------------------------------------
 
 function updateControls() {
@@ -1225,11 +1265,10 @@ function updateControls() {
     resumeBtn.disabled = true;  stopBtn.disabled = true;
   }
 
-  // The backend/model cannot be swapped while audio is being captured.
-  const lockEngineChoice = appState === 'recording';
-  if (modelSelect) modelSelect.disabled = lockEngineChoice;
-  if (deviceSelect) deviceSelect.disabled = lockEngineChoice;
-  if (loadModelBtn) loadModelBtn.disabled = lockEngineChoice || modelLoading;
+  const lockChoice = appState === 'recording';
+  if (modelSelect) modelSelect.disabled = lockChoice;
+  if (deviceSelect) deviceSelect.disabled = lockChoice;
+  if (loadModelBtn) loadModelBtn.disabled = lockChoice || modelLoading;
 }
 
 function updateStatus(status) {
@@ -1259,7 +1298,7 @@ function updateStatus(status) {
 }
 
 // -------------------------------------------------------------
-// 14. Language Chips (Auto detect + optional manual hint)
+// 15. Language Chips (Auto / Malayalam / Arabic / English)
 // -------------------------------------------------------------
 
 langChips.forEach(chip => {
@@ -1273,7 +1312,7 @@ langChips.forEach(chip => {
     if (mode === 'auto') {
       currentLangCode = LANG_CONFIG.MALAYALAM.code;
       updateLanguageUI(LANG_CONFIG.MALAYALAM);
-      showToast('Auto-detect enabled — Whisper identifies the language from your voice.', 'info');
+      showToast('Auto-detect enabled. Whisper detects spoken language from audio.', 'info');
     } else {
       currentLangCode = mode;
       const langObj = Object.values(LANG_CONFIG).find(l => l.code === mode) || LANG_CONFIG.MALAYALAM;
@@ -1284,7 +1323,7 @@ langChips.forEach(chip => {
 });
 
 // -------------------------------------------------------------
-// 15. Timer (MM:SS)
+// 16. Timer System
 // -------------------------------------------------------------
 
 function startTimer() {
@@ -1305,7 +1344,7 @@ function renderTimer() {
 }
 
 // -------------------------------------------------------------
-// 16. Word & Character Counters
+// 17. Word & Character Counters
 // -------------------------------------------------------------
 
 function updateCounters() {
@@ -1316,20 +1355,19 @@ function updateCounters() {
   totalCharsNoSpaceEl.textContent = text.replace(/\s/g, '').length.toLocaleString();
 }
 
-// Manual edits stay authoritative and are never overwritten mid-recording.
 textEditor.addEventListener('input', () => {
   finalTranscript = textEditor.value;
   updateCounters();
 });
 
 // -------------------------------------------------------------
-// 17. On-Device Engine Card listeners
+// 18. Engine Card Listeners
 // -------------------------------------------------------------
 
 if (loadModelBtn) {
   loadModelBtn.addEventListener('click', async () => {
     if (modelReady && loadedModelKey === (modelSelect ? modelSelect.value : '')) {
-      showToast('That model is already loaded.', 'info');
+      showToast('This model is already loaded and ready to transcribe.', 'info');
       return;
     }
     await loadModel();
@@ -1342,13 +1380,12 @@ if (modelSelect) {
     const key = modelSelect.value;
     if (key === loadedModelKey && modelReady) return;
 
-    // A different model means the queued audio can no longer be decoded.
     transcriptionQueue.length = 0;
     segmentsQueued = segmentsDone;
     modelReady = false;
     loadedModelKey = null;
     loadModelBtnText.textContent = 'Load Model';
-    setModelProgress(0, 'Model changed — click Load Model.');
+    setModelProgress(0, 'Model selection changed — click Load Model.');
     updateInterimState();
   });
 }
@@ -1360,17 +1397,17 @@ if (deviceSelect) {
     modelReady = false;
     loadedModelKey = null;
     loadModelBtnText.textContent = 'Load Model';
-    setModelProgress(0, `Backend changed — reload ${spec ? spec.label : 'the model'}.`);
+    setModelProgress(0, `Backend selection changed — reload ${spec ? spec.label : 'the model'}.`);
   });
 }
 
 // -------------------------------------------------------------
-// 18. Actions (Copy, Download TXT, Clear, Select All)
+// 19. Action Buttons (Copy, TXT Download, Clear, Select All)
 // -------------------------------------------------------------
 
 copyBtn.addEventListener('click', async () => {
   const text = textEditor.value.trim();
-  if (!text) { showToast('There is no text to copy!', 'warning'); return; }
+  if (!text) { showToast('No text available to copy.', 'warning'); return; }
 
   try {
     await navigator.clipboard.writeText(text);
@@ -1378,7 +1415,7 @@ copyBtn.addEventListener('click', async () => {
     copyIcon.setAttribute('data-lucide', 'check');
     copyBtn.classList.add('bg-emerald-50', 'text-emerald-700', 'border-emerald-300', 'dark:bg-emerald-950/50', 'dark:text-emerald-300');
     if (window.lucide) lucide.createIcons();
-    showToast('Text copied to clipboard!', 'success');
+    showToast('Transcription copied to clipboard!', 'success');
 
     setTimeout(() => {
       copyBtnText.textContent = 'Copy Text';
@@ -1387,14 +1424,13 @@ copyBtn.addEventListener('click', async () => {
       if (window.lucide) lucide.createIcons();
     }, 2000);
   } catch (err) {
-    console.error('Clipboard copy failed:', err);
-    showToast('Failed to copy text.', 'error');
+    showToast('Failed to copy to clipboard.', 'error');
   }
 });
 
 downloadTxtBtn.addEventListener('click', () => {
   const text = textEditor.value.trim();
-  if (!text) { showToast('Editor is empty. Nothing to download!', 'warning'); return; }
+  if (!text) { showToast('Textarea is empty. Nothing to download.', 'warning'); return; }
 
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
@@ -1419,7 +1455,6 @@ clearBtn.addEventListener('click', () => {
   if (!textEditor.value.trim()) return;
 
   if (confirm('Are you sure you want to clear the entire text editor?')) {
-    // Invalidate anything still decoding so it cannot repopulate the editor.
     transcriptGeneration += 1;
     transcriptionQueue.length = 0;
     activeJob = null;
@@ -1445,8 +1480,22 @@ selectAllBtn.addEventListener('click', () => {
   showToast('All text selected.', 'info');
 });
 
+// Diagnostic Panel Collapse/Expand Toggle
+if (toggleDebugBtn && debugContent) {
+  toggleDebugBtn.addEventListener('click', () => {
+    const isHidden = debugContent.classList.contains('hidden');
+    if (isHidden) {
+      debugContent.classList.remove('hidden');
+      toggleDebugBtn.textContent = 'Collapse';
+    } else {
+      debugContent.classList.add('hidden');
+      toggleDebugBtn.textContent = 'Expand';
+    }
+  });
+}
+
 // -------------------------------------------------------------
-// 19. Button Listeners
+// 20. Session Button Listeners
 // -------------------------------------------------------------
 
 startBtn.addEventListener('click', () => { resetTimer(); startSession(); });
@@ -1455,7 +1504,7 @@ resumeBtn.addEventListener('click', () => { resumeSession(); });
 stopBtn.addEventListener('click', () => { stopSession(); });
 
 // -------------------------------------------------------------
-// 20. Keyboard Shortcuts
+// 21. Keyboard Shortcuts
 // -------------------------------------------------------------
 
 document.addEventListener('keydown', (e) => {
@@ -1472,11 +1521,10 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// Release the microphone if the page is closed while recording.
 window.addEventListener('beforeunload', () => { if (micStream) stopCapture(); });
 
 // -------------------------------------------------------------
-// 21. Light / Dark Theme
+// 22. Light / Dark Theme
 // -------------------------------------------------------------
 
 function applyTheme(isDark) {
@@ -1499,13 +1547,16 @@ themeToggleBtn.addEventListener('click', () => {
 });
 
 // -------------------------------------------------------------
-// 22. Bootstrap
+// 23. Application Bootstrap
 // -------------------------------------------------------------
 
 window.addEventListener('DOMContentLoaded', () => {
   if (window.lucide) lucide.createIcons();
 
   applyTheme((localStorage.getItem('voicetype_theme') || 'light') === 'dark');
+
+  // Device capability detection & configuration
+  applyDeviceProfile();
 
   checkMicrophonePermission();
   updateControls();
@@ -1524,16 +1575,16 @@ window.addEventListener('DOMContentLoaded', () => {
       dbgSupported.textContent = 'No (Unsupported)';
       dbgSupported.className = 'font-bold text-rose-400 text-xs mt-0.5';
     }
-    setModelProgress(0, 'WebAssembly worker unavailable in this browser.', true);
+    setModelProgress(0, 'WebAssembly and Worker execution are unavailable in this browser.', true);
     return;
   }
 
   if (dbgSupported) {
     dbgSupported.textContent = support.hasWebGPU
-      ? 'Yes (On-device · WebGPU available)'
-      : 'Yes (On-device · WebAssembly)';
+      ? 'Yes (On-device · WebGPU acceleration ready)'
+      : 'Yes (On-device · WebAssembly CPU mode)';
     dbgSupported.className = 'font-bold text-emerald-400 text-xs mt-0.5';
   }
 
-  showToast('On-device engine ready. Press Load Model, then Start.', 'info');
+  showToast('VoiceType on-device engine ready. Click Load Model, then Start.', 'info');
 });
