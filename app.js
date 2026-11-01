@@ -5,9 +5,9 @@
  * ---------------------------------------------------------------------------
  * 1. SERVER ENGINE (primary)  – records audio with MediaRecorder, splits it at
  *    natural silences into disjoint phrase chunks, and posts each chunk to
- *    /api/transcribe (OpenAI Whisper). Whisper identifies the language FROM THE
- *    AUDIO and returns text in the original writing system (Malayalam /
- *    Arabic / English). API key stays server-side.
+ *    /api/transcribe (Whisper via Groq or OpenAI). Whisper identifies the
+ *    language FROM THE AUDIO and returns text in the original writing system
+ *    (Malayalam / Arabic / English). API key stays server-side.
  *
  * 2. BROWSER ENGINE (fallback) – the Web Speech API, used only when the server
  *    engine is not configured/reachable. It is append-only: it processes only
@@ -44,12 +44,17 @@ const SCRIPT_PATTERNS = {
 };
 
 // Voice-activity-detection tuning for the server engine.
+// The speech gate is ADAPTIVE — it is derived from the measured room noise, so
+// a quiet microphone still registers speech instead of staying silent.
 const VAD = {
-  INTERVAL_MS: 60,          // how often the mic level is sampled
-  SPEECH_RMS: 0.018,        // RMS above this counts as speech
-  SILENCE_FLUSH_MS: 850,    // pause length that closes a phrase
-  MIN_CHUNK_MS: 700,        // ignore blips shorter than this
-  MAX_CHUNK_MS: 12000       // hard cap so latency stays low
+  INTERVAL_MS: 60,           // how often the mic level is sampled
+  CALIBRATION_MS: 800,       // listen to room noise before gating
+  MIN_GATE: 0.006,           // most sensitive gate we will ever use
+  NOISE_MULTIPLIER: 2.2,     // gate = max(MIN_GATE, noiseFloor * this)
+  SILENCE_FLUSH_MS: 850,     // pause length that closes a phrase
+  MIN_CHUNK_MS: 700,         // ignore blips shorter than this
+  PERIODIC_FLUSH_MS: 4000,   // never sit on continuous speech longer than this
+  MAX_CHUNK_MS: 15000        // hard cap; silent leftovers are discarded
 };
 
 // -------------------------------------------------------------
@@ -59,6 +64,7 @@ const VAD = {
 let recognition = null;          // Web Speech instance (browser engine)
 let engineMode = 'browser';      // 'server' | 'browser'  (active engine)
 let serverConfigured = null;     // null = probing, true/false = known
+let serverProvider = '';         // 'groq' | 'openai' when known
 
 let appState = 'idle';           // 'idle' | 'recording' | 'paused' | 'stopped'
 let activeMode = 'auto';         // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
@@ -91,6 +97,12 @@ let chunkParts = [];
 let chunkStartedAt = 0;
 let lastVoiceAt = 0;
 let sawSpeechInChunk = false;
+let peakRms = 0;                 // loudest sample seen in the current chunk
+let discardNextChunk = false;    // true => chunk holds only silence, never sent
+let noiseFloor = null;           // measured room noise (null until calibrated)
+let noiseSamples = [];
+let vadCalibrationAt = 0;
+let lastLevelUiAt = 0;
 let pendingTranscriptions = 0;
 let serverFailures = 0;
 let flushInFlight = false;
@@ -238,10 +250,17 @@ function updateMicPermissionUI(state) {
 // 6. Language Helpers
 // -------------------------------------------------------------
 
-function langByShort(short) {
-  if (!short) return null;
-  const s = String(short).toLowerCase().slice(0, 2);
-  return Object.values(LANG_CONFIG).find(l => l.short === s) || null;
+/**
+ * Normalize the language value returned by the ASR service. Providers differ:
+ * OpenAI/Groq return either ISO-639-1 codes ('ml') or full names ('malayalam').
+ */
+function langFromApi(value) {
+  if (!value) return null;
+  const v = String(value).toLowerCase().trim();
+  if (v.startsWith('ml') || v.startsWith('mal')) return LANG_CONFIG.MALAYALAM;
+  if (v.startsWith('ar')) return LANG_CONFIG.ARABIC;
+  if (v.startsWith('en')) return LANG_CONFIG.ENGLISH;
+  return null;
 }
 
 function updateLanguageUI(langObj) {
@@ -365,13 +384,15 @@ async function probeServerEngine() {
     if (!res.ok) throw new Error(`status ${res.status}`);
     const data = await res.json();
     serverConfigured = Boolean(data && data.configured);
+    serverProvider = (data && data.provider) || '';
   } catch (err) {
     serverConfigured = false;
+    serverProvider = '';
   }
 
   if (dbgSupported) {
     if (serverConfigured) {
-      dbgSupported.textContent = 'Yes (Whisper Server ASR)';
+      dbgSupported.textContent = `Yes (Whisper via ${serverProvider || 'server'})`;
       dbgSupported.className = 'font-bold text-emerald-400 text-xs mt-0.5';
     } else if (window.SpeechRecognition || window.webkitSpeechRecognition) {
       dbgSupported.textContent = 'Yes (Browser Web Speech)';
@@ -409,12 +430,18 @@ function beginChunk() {
   chunkStartedAt = Date.now();
   lastVoiceAt = Date.now();
   sawSpeechInChunk = false;
+  peakRms = 0;
+  discardNextChunk = false;
 
   chunkRecorder.ondataavailable = (e) => { if (e.data && e.data.size) chunkParts.push(e.data); };
   chunkRecorder.onstop = () => {
     const blob = new Blob(chunkParts, { type: chunkRecorder.mimeType || 'audio/webm' });
     chunkParts = [];
-    sendChunkForTranscription(blob);
+    if (discardNextChunk) {
+      discardNextChunk = false;          // silence-only audio is never sent
+    } else {
+      sendChunkForTranscription(blob);
+    }
     if (appState === 'recording') beginChunk();
   };
 
@@ -425,6 +452,9 @@ function flushChunk() {
   if (flushInFlight) return;
   if (!chunkRecorder || chunkRecorder.state !== 'recording') return;
   flushInFlight = true;
+  // A chunk that never contained speech is dropped rather than sent, so the
+  // ASR service is never asked to invent words from silence.
+  if (!sawSpeechInChunk) discardNextChunk = true;
   try {
     chunkRecorder.stop();
   } catch (err) {
@@ -449,25 +479,62 @@ function startVadLoop() {
     }
     const rms = Math.sqrt(sum / vadBuffer.length);
     const now = Date.now();
+    if (rms > peakRms) peakRms = rms;
 
-    if (rms > VAD.SPEECH_RMS) {
+    // Phase 1 — measure the room so the gate matches this microphone.
+    if (now - vadCalibrationAt < VAD.CALIBRATION_MS) {
+      noiseSamples.push(rms);
+      if (rms > VAD.MIN_GATE) { sawSpeechInChunk = true; lastVoiceAt = now; }
+      updateLevelDiagnostic(rms, VAD.MIN_GATE, true);
+      return;
+    }
+
+    // Phase 2 — derive the adaptive gate once, then use it.
+    if (noiseFloor === null) {
+      noiseFloor = noiseSamples.length
+        ? noiseSamples.reduce((a, b) => a + b, 0) / noiseSamples.length
+        : 0;
+      noiseSamples = [];
+    }
+    const gate = Math.max(VAD.MIN_GATE, noiseFloor * VAD.NOISE_MULTIPLIER);
+
+    if (rms > gate) {
       sawSpeechInChunk = true;
       lastVoiceAt = now;
-      if (dbgSpeech) {
-        dbgSpeech.textContent = 'Speech Detected';
-        dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5';
-      }
     }
+    updateLevelDiagnostic(rms, gate, false);
 
     const chunkAge = now - chunkStartedAt;
     const silentFor = now - lastVoiceAt;
 
     if (sawSpeechInChunk && silentFor > VAD.SILENCE_FLUSH_MS && chunkAge > VAD.MIN_CHUNK_MS) {
-      flushChunk();                       // phrase finished — transcribe it
+      flushChunk();                                    // natural pause: send now
+    } else if (chunkAge > VAD.PERIODIC_FLUSH_MS && peakRms > gate) {
+      flushChunk();                                    // continuous speech: don't wait
     } else if (chunkAge > VAD.MAX_CHUNK_MS) {
-      flushChunk();                       // safety cap for very long speech
+      flushChunk();                                    // safety cap (silence gets dropped)
     }
   }, VAD.INTERVAL_MS);
+}
+
+/** Live mic-level readout so "it can't hear me" is diagnosable at a glance. */
+function updateLevelDiagnostic(rms, gate, calibrating) {
+  if (!dbgSpeech) return;
+  const now = Date.now();
+  if (now - lastLevelUiAt < 250) return;
+  lastLevelUiAt = now;
+
+  if (rms > gate) {
+    dbgSpeech.textContent = calibrating
+      ? 'Calibrating…'
+      : `Speech Detected (${rms.toFixed(3)} > ${gate.toFixed(3)})`;
+    dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+  } else {
+    dbgSpeech.textContent = calibrating
+      ? `Calibrating… level ${rms.toFixed(3)}`
+      : `Listening — level ${rms.toFixed(3)} / gate ${gate.toFixed(3)}`;
+    dbgSpeech.className = 'font-bold text-slate-400 text-xs mt-0.5';
+  }
 }
 
 function stopVadLoop() {
@@ -527,7 +594,7 @@ async function sendChunkForTranscription(blob) {
     const data = await res.json();
 
     if (data && data.text) {
-      const langObj = langByShort(data.language) || detectedLang;
+      const langObj = langFromApi(data.language) || detectedLang;
       // Unique id per chunk => committed exactly once.
       commitSegment(langObj.code, data.text, makeSegmentId('chunk'));
     } else if (dbgResult) {
@@ -604,6 +671,10 @@ async function startServerEngine() {
 
   if (dbgAudio) { dbgAudio.textContent = 'Yes (Mic Streaming)'; dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
   if (dbgStarted) { dbgStarted.textContent = 'Yes (Server Engine)'; dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
+
+  vadCalibrationAt = Date.now();
+  noiseFloor = null;
+  noiseSamples = [];
 
   beginChunk();
   startVadLoop();

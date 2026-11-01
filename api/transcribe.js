@@ -2,30 +2,60 @@
  * Vercel Serverless Function — Multilingual Speech Transcription
  *
  * POST /api/transcribe  { audio: <base64>, mimeType: 'audio/webm', languageHint?: 'ml' }
- *   -> { text: '<native script>', language: 'ml' | 'ar' | 'en' | ... }
+ *   -> { text: '<native script>', language: 'ml' | 'ar' | 'en' | 'malayalam' | ... }
  *
- * GET  /api/transcribe  -> { configured: boolean, engine: 'whisper-1' }
+ * GET  /api/transcribe  -> { configured: boolean, provider: 'groq' | 'openai', engine: '<model>' }
  *
- * The API key lives ONLY in the server environment (OPENAI_API_KEY).
- * It is never sent to, or readable by, the browser.
+ * Provider order (first key found in the environment wins):
+ *   1. Groq   — GROQ_API_KEY   (free tier)  whisper-large-v3
+ *   2. OpenAI — OPENAI_API_KEY              whisper-1
+ * Both speak the same OpenAI-compatible /audio/transcriptions protocol.
+ *
+ * Keys live ONLY in the server environment. They are never sent to, or
+ * readable by, the browser.
  *
  * Whisper performs language identification on the AUDIO itself and always
  * returns the text in the ORIGINAL writing system (Malayalam / Arabic /
  * English). It never transliterates one script into another.
  */
 
-const OPENAI_TRANSCRIPTION_URL = 'https://api.openai.com/v1/audio/transcriptions';
+const PROVIDERS = [
+  {
+    id: 'groq',
+    envVar: 'GROQ_API_KEY',
+    url: 'https://api.groq.com/openai/v1/audio/transcriptions',
+    model: 'whisper-large-v3'
+  },
+  {
+    id: 'openai',
+    envVar: 'OPENAI_API_KEY',
+    url: 'https://api.openai.com/v1/audio/transcriptions',
+    model: 'whisper-1'
+  }
+];
+
 const UPSTREAM_TIMEOUT_MS = 25000;
 const MIN_AUDIO_BYTES = 1200; // below this there is nothing transcribable
+
+/** First provider that has a key configured in the environment. */
+function pickProvider() {
+  for (const provider of PROVIDERS) {
+    if (process.env[provider.envVar]) return provider;
+  }
+  return null;
+}
 
 async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
 
+  const provider = pickProvider();
+
   // Capability probe used by the frontend to decide which engine to run.
   if (req.method === 'GET') {
     return res.status(200).json({
-      configured: Boolean(process.env.OPENAI_API_KEY),
-      engine: 'whisper-1'
+      configured: Boolean(provider),
+      provider: provider ? provider.id : null,
+      engine: provider ? provider.model : null
     });
   }
 
@@ -34,8 +64,7 @@ async function handler(req, res) {
     return res.status(405).json({ error: 'method_not_allowed' });
   }
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
+  if (!provider) {
     // Frontend falls back to the browser engine when it sees this.
     return res.status(503).json({ error: 'server_asr_not_configured' });
   }
@@ -68,7 +97,7 @@ async function handler(req, res) {
   try {
     const form = new FormData();
     form.append('file', new Blob([buffer], { type: mimeType || 'audio/webm' }), 'chunk.webm');
-    form.append('model', 'whisper-1');
+    form.append('model', provider.model);
     form.append('response_format', 'verbose_json');
     form.append('temperature', '0');
     // Only hint the language when the user explicitly picked one.
@@ -80,9 +109,9 @@ async function handler(req, res) {
 
     let upstream;
     try {
-      upstream = await fetch(OPENAI_TRANSCRIPTION_URL, {
+      upstream = await fetch(provider.url, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: { Authorization: `Bearer ${process.env[provider.envVar]}` },
         body: form,
         signal: controller.signal
       });
@@ -94,6 +123,7 @@ async function handler(req, res) {
       const detail = await upstream.text().catch(() => '');
       return res.status(502).json({
         error: 'asr_upstream_error',
+        provider: provider.id,
         status: upstream.status,
         detail: detail.slice(0, 300)
       });
@@ -104,12 +134,14 @@ async function handler(req, res) {
     return res.status(200).json({
       text: typeof data.text === 'string' ? data.text.trim() : '',
       language: data.language || null,
-      duration: typeof data.duration === 'number' ? data.duration : null
+      duration: typeof data.duration === 'number' ? data.duration : null,
+      provider: provider.id
     });
   } catch (err) {
     const aborted = err && err.name === 'AbortError';
     return res.status(aborted ? 504 : 500).json({
       error: aborted ? 'asr_timeout' : 'transcription_failed',
+      provider: provider.id,
       detail: String((err && err.message) || err).slice(0, 300)
     });
   }
