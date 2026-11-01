@@ -1,79 +1,55 @@
-/* VoxScribe Custom Styling & Animations */
+/* VoiceType – Custom Styles and Animations */
 
-/* Custom Scrollbar */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.6);
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(99, 102, 241, 0.4);
-  border-radius: 9999px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(99, 102, 241, 0.7);
+/* Custom Smooth Transitions */
+body {
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
-/* Language Tab Navigation */
-.lang-tab {
-  color: #94a3b8;
-}
-.lang-tab:hover {
-  color: #f8fafc;
-}
-.lang-tab.active {
-  background: #4f46e5;
-  color: #ffffff;
-  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.35);
-}
-
-/* Pulsing Mic Effect */
-@keyframes ping-slow {
+/* Pulsing Red Dot for Live Recording */
+@keyframes record-pulse {
   0% {
     transform: scale(0.95);
-    opacity: 0.8;
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
   }
-  50% {
-    transform: scale(1.35);
-    opacity: 0.3;
+  70% {
+    transform: scale(1.15);
+    box-shadow: 0 0 0 8px rgba(239, 68, 68, 0);
   }
   100% {
-    transform: scale(1.7);
-    opacity: 0;
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
   }
 }
 
-.is-recording #micRing1 {
-  animation: ping-slow 2.4s cubic-bezier(0, 0, 0.2, 1) infinite;
-  opacity: 1;
+.recording-dot {
+  background-color: #ef4444 !important;
+  animation: record-pulse 1.8s infinite ease-in-out;
 }
 
-.is-recording #micRing2 {
-  animation: ping-slow 2.4s cubic-bezier(0, 0, 0.2, 1) infinite 1.2s;
-  opacity: 1;
+/* Custom Scrollbar for Textarea */
+textarea::-webkit-scrollbar {
+  width: 6px;
+}
+textarea::-webkit-scrollbar-track {
+  background: transparent;
+}
+textarea::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.4);
+  border-radius: 9999px;
+}
+textarea::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.7);
 }
 
-.is-recording #toggleRecordBtn {
-  background: linear-gradient(135deg, #ef4444, #dc2626) !important;
-  box-shadow: 0 0 35px rgba(239, 68, 68, 0.5) !important;
-}
-
-.is-recording #ambientGlow {
-  background: rgba(239, 68, 68, 0.15) !important;
-}
-
-/* Malayalam & Arabic Font Tweaks */
-[lang="ml"], .font-malayalam, [data-script="malayalam"] {
+/* Script Font Classes */
+[lang="ml"], .font-malayalam, [data-script="ml"] {
   font-family: 'Noto Sans Malayalam', 'Kartika', 'Nirmala UI', sans-serif;
   line-height: 1.85;
 }
 
-[lang="ar"], .font-arabic, [data-script="arabic"] {
+[lang="ar"], [lang="ur"], .font-arabic, [data-script="ar"] {
   font-family: 'Noto Sans Arabic', 'Amiri', 'Segoe UI', Tahoma, sans-serif;
   line-height: 1.9;
-  letter-spacing: 0;
 }
 
 /* Toast Transitions */
@@ -82,8 +58,7 @@
   opacity: 1;
 }
 
-/* Highlighting editable text outline nicely */
-#transcriptContent:focus {
-  outline: none;
+/* Keyboard hint styling */
+kbd {
+  box-shadow: 0 1px 1px rgba(0, 0, 0, 0.08);
 }
-

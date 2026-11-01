@@ -1,54 +1,70 @@
-# 🎙️ VoxScribe Live - Real-Time Multilingual Speech-to-Text
+# 🎙️ VoiceType – Live Speech to Text
 
-A modern, responsive web application for real-time speech-to-text transcription in **Malayalam**, **Arabic**, and **English** with automatic script/language detection, live audio visualizer, dynamic text direction (RTL/LTR), one-click clipboard copying, and high-fidelity PDF export.
-
----
-
-## ✨ Features
-
-- **🔴 Start / Pause Controls:** Dedicated buttons to easily start recording and pause transcription at any time, plus quick-mic toggle.
-- **⚡ Real-Time Streaming Text:** Displays interim/provisional speech live as you speak, seamlessly committing finalized phrases.
-- **✏️ Editable Text Box:** Click directly into the transcript box at any time to fix typos, add punctuation, or modify transcribed text in real time.
-- **🔢 Real-Time Word Counter:** Live word and character counting that updates dynamically as you speak or edit.
-- **📋 Copy to Clipboard:** One-click copy with instant visual checkmark feedback and toast notification.
-- **💾 Download Options:**
-  - **Download .TXT:** Instant download of clean plain-text transcripts (`.txt`).
-  - **Download PDF:** High-fidelity Unicode PDF export preserving Arabic RTL and Malayalam ligatures.
-- **🌐 Automatic Language Understanding:**
-  - **Malayalam (`ml-IN`):** Supports complex conjuncts (കൂട്ടക്ഷരങ്ങൾ) and chillu characters (ചില്ലക്ഷരങ്ങൾ).
-  - **Arabic (`ar-SA`):** Automatically triggers **Right-to-Left (`dir="rtl"`)** alignment and cursive Arabic shaping.
-  - **English (`en-US`):** High-accuracy real-time punctuation and phonetics.
-- **📊 Live Audio Visualizer:** Dynamic frequency bar visualizer with real-time decibel level metering.
-- **🚀 Zero Installation Needed:** Built with modern web standards and standalone zero-dependency architecture. Runs on any modern browser (Chrome, Edge, Safari, Brave).
+A modern, professional, fully responsive web application that captures live microphone audio and converts spoken words into editable text in real time using the browser's native **Web Speech API** (`webkitSpeechRecognition` / `SpeechRecognition`).
 
 ---
 
-## 🚀 How to Run the Application
+## ✨ Key Features
 
-### Option 1: Quick Launcher (Recommended)
+### 1. Speech Recognition Lifecycle
+- **▶ Start Button:** Requests microphone permission and begins live transcription.
+- **⏸ Pause Button:** Temporarily halts recognition while safely preserving all previously transcribed text.
+- **⏯ Resume Button:** Continues transcription right where you left off without any duplicated text.
+- **⏹ Stop Button:** Completely stops the current recording session.
+- **🔴 Pulsing Recording Indicator:** Subtle animated pulsing red dot indicating active listening.
+- **⚡ Zero Duplication Engine:** Finalized phrases and real-time interim speech are handled separately to guarantee text is never duplicated.
+
+### 2. Multi-Language Support
+- **English (US)** (`en-US`) – *Default*
+- **English (UK)** (`en-GB`)
+- **Malayalam (India)** (`ml-IN`) – Complex ligatures and conjunct support
+- **Arabic (Saudi Arabia)** (`ar-SA`) – Automatic **Right-to-Left (RTL)** text alignment
+- **Hindi (India)** (`hi-IN`)
+- **Urdu (Pakistan)** (`ur-PK`) – Automatic **Right-to-Left (RTL)** text alignment
+- **Tamil (India)** (`ta-IN`)
+
+### 3. Editable Text Editor & Real-Time Counters
+- **Full Text Editing:** Click anywhere to manually edit, type, insert punctuation, or delete text.
+- **Live Statistics:**
+  - **Total Words:** Count of words in real time.
+  - **Total Characters:** Total character count including spaces.
+  - **Total Characters (excluding spaces):** Exact non-whitespace character count.
+  - Automatically updates as speech streams in or when manually edited.
+
+### 4. Action Toolbar & Productivity
+- **📋 Copy Text:** One-click clipboard copy with animated feedback (`Ctrl + Shift + C`).
+- **📥 Download TXT:** Instant download as a clean timestamped `.txt` document.
+- **🗑️ Clear Text:** Safely clears the editor after user confirmation.
+- **☑️ Select All:** One-click selection of the full transcript.
+- **⏱️ Timer:** Displays elapsed speaking duration in `MM:SS` format.
+- **🌓 Light / Dark Mode:** Professional light theme by default with seamless toggle to dark mode.
+
+### 5. Keyboard Shortcuts
+| Shortcut | Action |
+|---|---|
+| <kbd>Ctrl</kbd> + <kbd>Enter</kbd> (or <kbd>Cmd</kbd> + <kbd>Enter</kbd>) | **Start** / **Resume** / **Pause** recording |
+| <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd> | **Copy** text to clipboard |
+
+### 6. Privacy & Security
+> **Privacy Notice:** Your microphone audio is processed through browser speech recognition. This application does not intentionally store or transmit your audio to external servers.
+
+---
+
+## 🚀 How to Run Locally
+
+### Option 1: 1-Click Server Launcher (Recommended)
 1. Double-click **`start-server.bat`** in this folder.
-2. It starts a lightweight local server on `http://localhost:5000` and opens your default browser automatically.
-3. Allow microphone permission when prompted.
+2. It launches a local server at **`http://localhost:5000/`** and opens your default browser automatically.
 
 ### Option 2: Direct Browser Open
-Simply double-click **`index.html`** to open it directly in **Google Chrome**, **Microsoft Edge**, or **Brave**.
+Double-click **`index.html`** to open it directly in **Google Chrome**, **Microsoft Edge**, or **Brave**.
 
 ---
 
 ## 🛠️ Technology Stack
-
-| Layer | Technology |
-|---|---|
-| **Frontend Framework** | HTML5 / Modern ES6+ JavaScript |
-| **Styling & UI** | Tailwind CSS (Dark/Glassmorphism theme) |
-| **Icons** | Lucide Icons |
-| **Speech Engine** | Web Speech API (`webkitSpeechRecognition`) |
-| **Audio Processing** | Web Audio API (`AudioContext`, `AnalyserNode`) |
-| **Typography** | Google Fonts (`Noto Sans Malayalam`, `Noto Sans Arabic`, `Inter`) |
-| **PDF Generation** | `html2pdf.js` + `html2canvas` (with 2x retina scale for crystal-clear complex fonts) |
-
----
-
-## 🔒 Privacy
-All speech recognition and processing runs locally in your browser. No audio recordings are stored on any server.
-
+- **Architecture:** HTML5, CSS3, Vanilla JavaScript (ES6+)
+- **Styling:** Tailwind CSS (Light / Dark mode, centered 900px responsive layout)
+- **Icons:** Lucide Icons
+- **Speech Engine:** Web Speech API (`webkitSpeechRecognition` / `SpeechRecognition`)
+- **Typography:** Google Fonts (`Inter`, `Noto Sans Malayalam`, `Noto Sans Arabic`)
+- **File Export:** Client-side Blob API & Object URL

@@ -1,435 +1,327 @@
 /**
- * VoxScribe Live Engine
- * Real-Time Multilingual Speech-to-Text in Malayalam, Arabic, and English
- * Features: Auto Language Detection, Web Audio Visualizer, Live Streaming,
- *           RTL/LTR dynamic switching, Copying, and Unicode-accurate PDF Export.
+ * VoiceType – Live Speech to Text
+ * Pure Vanilla JavaScript implementation of Web Speech API
+ * Features: Start, Pause, Resume, Stop, Multi-Language, Live Word/Char Counters,
+ *           TXT Download, Clipboard Copy, Keyboard Shortcuts & Dark Mode.
  */
 
-// State variables
+// State Management
 let recognition = null;
-let isRecording = false;
-let currentLanguageMode = 'auto'; // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
-let detectedLanguage = 'en'; // default baseline
+let appState = 'idle'; // 'idle' | 'recording' | 'paused' | 'stopped'
 let finalTranscript = '';
 let interimTranscript = '';
-let recordingStartTime = null;
-let timerInterval = null;
+let isIntentionalStop = false;
 
-// Audio context & Visualizer
-let audioContext = null;
-let analyserNode = null;
-let microphoneStream = null;
-let animationFrameId = null;
+// Timer State
+let timerInterval = null;
+let elapsedSeconds = 0;
 
 // DOM Elements
-const toggleRecordBtn = document.getElementById('toggleRecordBtn');
+const textEditor = document.getElementById('textEditor');
+const interimStream = document.getElementById('interimStream');
+const interimText = document.getElementById('interimText');
+
 const startBtn = document.getElementById('startBtn');
 const pauseBtn = document.getElementById('pauseBtn');
-const micIcon = document.getElementById('micIcon');
-const micActionHeading = document.getElementById('micActionHeading');
-const micActionSub = document.getElementById('micActionSub');
+const resumeBtn = document.getElementById('resumeBtn');
+const stopBtn = document.getElementById('stopBtn');
+
+const languageSelect = document.getElementById('languageSelect');
+const statusPill = document.getElementById('statusPill');
+const statusDot = document.getElementById('statusDot');
+const statusLabel = document.getElementById('statusLabel');
 const timerDisplay = document.getElementById('timerDisplay');
-const visualizerCanvas = document.getElementById('visualizerCanvas');
-const decibelLevel = document.getElementById('decibelLevel');
-const canvasCtx = visualizerCanvas.getContext('2d');
 
-const statusBadge = document.getElementById('statusBadge');
-const statusText = document.getElementById('statusText');
-const detectedLangBadge = document.getElementById('detectedLangBadge');
-const detectedLangText = document.getElementById('detectedLangText');
-const wordCountEl = document.getElementById('wordCount');
-const charCountEl = document.getElementById('charCount');
+const totalWordsEl = document.getElementById('totalWords');
+const totalCharsEl = document.getElementById('totalChars');
+const totalCharsNoSpaceEl = document.getElementById('totalCharsNoSpace');
 
-const emptyPlaceholder = document.getElementById('emptyPlaceholder');
-const transcriptContent = document.getElementById('transcriptContent');
-const interimPreview = document.getElementById('interimPreview');
-const transcriptScrollContainer = document.getElementById('transcriptScrollContainer');
-
-const clearBtn = document.getElementById('clearBtn');
 const copyBtn = document.getElementById('copyBtn');
 const copyBtnText = document.getElementById('copyBtnText');
 const copyIcon = document.getElementById('copyIcon');
 const downloadTxtBtn = document.getElementById('downloadTxtBtn');
-const downloadPdfBtn = document.getElementById('downloadPdfBtn');
+const clearBtn = document.getElementById('clearBtn');
+const selectAllBtn = document.getElementById('selectAllBtn');
 
-const langTabs = document.querySelectorAll('.lang-tab');
-const mobileLangSelect = document.getElementById('mobileLangSelect');
+const themeToggleBtn = document.getElementById('themeToggleBtn');
+const themeIcon = document.getElementById('themeIcon');
+const toast = document.getElementById('toast');
+const toastMsg = document.getElementById('toastMsg');
+const toastIcon = document.getElementById('toastIcon');
+const unsupportedAlert = document.getElementById('unsupportedAlert');
 
-// Toast Notification Helper
+// -------------------------------------------------------------
+// 1. Toast Notification System
+// -------------------------------------------------------------
+let toastTimeout = null;
+
 function showToast(message, type = 'success') {
-  const toast = document.getElementById('toast');
-  const toastMsg = document.getElementById('toastMsg');
-  const toastIcon = document.getElementById('toastIcon');
+  if (toastTimeout) {
+    clearTimeout(toastTimeout);
+  }
 
   toastMsg.textContent = message;
-  
+
   if (type === 'success') {
-    toast.className = 'fixed top-5 right-5 z-50 flex items-center gap-3 px-4 py-3 rounded-xl shadow-2xl backdrop-blur-md border border-emerald-500/40 bg-emerald-950/90 text-emerald-200 show';
     toastIcon.setAttribute('data-lucide', 'check-circle');
-  } else if (type === 'error') {
-    toast.className = 'fixed top-5 right-5 z-50 flex items-center gap-3 px-4 py-3 rounded-xl shadow-2xl backdrop-blur-md border border-rose-500/40 bg-rose-950/90 text-rose-200 show';
+    toastIcon.className = 'w-5 h-5 text-emerald-500';
+  } else if (type === 'warning') {
     toastIcon.setAttribute('data-lucide', 'alert-circle');
+    toastIcon.className = 'w-5 h-5 text-amber-500';
+  } else if (type === 'error') {
+    toastIcon.setAttribute('data-lucide', 'alert-triangle');
+    toastIcon.className = 'w-5 h-5 text-rose-500';
   } else {
-    toast.className = 'fixed top-5 right-5 z-50 flex items-center gap-3 px-4 py-3 rounded-xl shadow-2xl backdrop-blur-md border border-indigo-500/40 bg-slate-900/90 text-indigo-200 show';
     toastIcon.setAttribute('data-lucide', 'info');
+    toastIcon.className = 'w-5 h-5 text-indigo-500';
   }
   lucide.createIcons();
 
-  setTimeout(() => {
+  toast.classList.add('show');
+  toastTimeout = setTimeout(() => {
     toast.classList.remove('show');
-  }, 3200);
+  }, 2600);
 }
 
 // -------------------------------------------------------------
-// 1. Language & Script Detection Engine
+// 2. Web Speech API Initialization & Lifecycle
 // -------------------------------------------------------------
-
-/**
- * Analyzes string content to detect Malayalam, Arabic, or English
- * Malayalam Unicode Range: 0D00–0D7F
- * Arabic Unicode Range: 0600–06FF, 0750–077F, 08A0–08FF, FB50–FDFF, FE70–FEFF
- * Latin Range: A-Za-z
- */
-function analyzeLanguageScript(text) {
-  if (!text || text.trim().length === 0) return detectedLanguage || 'en';
-
-  const malayalamRegex = /[\u0D00-\u0D7F]/g;
-  const arabicRegex = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/g;
-  const englishRegex = /[a-zA-Z]/g;
-
-  const mlMatches = (text.match(malayalamRegex) || []).length;
-  const arMatches = (text.match(arabicRegex) || []).length;
-  const enMatches = (text.match(englishRegex) || []).length;
-
-  if (arMatches > mlMatches && arMatches > enMatches) {
-    return 'ar';
-  } else if (mlMatches > arMatches && mlMatches > enMatches) {
-    return 'ml';
-  } else if (enMatches > 0) {
-    return 'en';
-  }
-
-  return detectedLanguage || 'en';
-}
-
-function updateLanguageDisplay(langCode) {
-  detectedLanguage = langCode;
-
-  if (langCode === 'ml') {
-    detectedLangText.textContent = 'മലയാളം (Malayalam)';
-    detectedLangBadge.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-950/70 border border-emerald-700/60 text-emerald-300';
-    transcriptContent.setAttribute('dir', 'ltr');
-    interimPreview.setAttribute('dir', 'ltr');
-    transcriptContent.classList.add('font-malayalam');
-    transcriptContent.classList.remove('font-arabic');
-  } else if (langCode === 'ar') {
-    detectedLangText.textContent = 'العربية (Arabic)';
-    detectedLangBadge.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-950/70 border border-amber-700/60 text-amber-300';
-    transcriptContent.setAttribute('dir', 'rtl');
-    interimPreview.setAttribute('dir', 'rtl');
-    transcriptContent.classList.add('font-arabic');
-    transcriptContent.classList.remove('font-malayalam');
-  } else {
-    detectedLangText.textContent = 'English';
-    detectedLangBadge.className = 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-sky-950/70 border border-sky-700/60 text-sky-300';
-    transcriptContent.setAttribute('dir', 'ltr');
-    interimPreview.setAttribute('dir', 'ltr');
-    transcriptContent.classList.remove('font-malayalam');
-    transcriptContent.classList.remove('font-arabic');
-  }
-}
-
-// -------------------------------------------------------------
-// 2. Web Speech API Recognition Initializer
-// -------------------------------------------------------------
-
 function initSpeechRecognition() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
   if (!SpeechRecognition) {
-    showToast('Web Speech API is not supported in this browser. Please use Google Chrome or Microsoft Edge.', 'error');
-    statusText.textContent = 'Unsupported Browser';
-    statusBadge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-rose-950/80 border border-rose-700/60 text-rose-300';
-    return false;
+    if (unsupportedAlert) unsupportedAlert.classList.remove('hidden');
+    startBtn.disabled = true;
+    updateStatus('unsupported');
+    return null;
   }
 
-  recognition = new SpeechRecognition();
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.maxAlternatives = 1;
+  const rec = new SpeechRecognition();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+  rec.lang = languageSelect.value || 'en-US';
 
-  // Set initial language based on selection
-  applyLanguageToRecognition();
-
-  recognition.onstart = () => {
-    isRecording = true;
-    document.body.classList.add('is-recording');
-    statusText.textContent = 'Listening...';
-    statusBadge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-rose-950/80 border border-rose-700/60 text-rose-300';
-    
-    micActionHeading.textContent = 'Recording Active';
-    micActionSub.textContent = 'Listening to your microphone in real time...';
-    micIcon.setAttribute('data-lucide', 'square');
-    lucide.createIcons();
-
-    if (startBtn) {
-      startBtn.disabled = true;
-    }
-    if (pauseBtn) {
-      pauseBtn.disabled = false;
-      pauseBtn.classList.remove('opacity-40', 'cursor-not-allowed');
-      pauseBtn.classList.add('bg-amber-600', 'text-white', 'hover:bg-amber-500', 'border-amber-500');
-      pauseBtn.classList.remove('bg-slate-800', 'text-slate-300');
-    }
-
+  rec.onstart = () => {
+    appState = 'recording';
+    updateControls();
+    updateStatus('listening');
     startTimer();
   };
 
-  recognition.onresult = (event) => {
+  rec.onresult = (event) => {
     let currentInterim = '';
 
     for (let i = event.resultIndex; i < event.results.length; ++i) {
-      const transcriptPiece = event.results[i][0].transcript;
+      const piece = event.results[i][0].transcript;
       if (event.results[i].isFinal) {
-        finalTranscript += (finalTranscript.length > 0 && !finalTranscript.endsWith(' ') ? ' ' : '') + transcriptPiece.trim();
+        // Append finalized text with proper spacing
+        if (finalTranscript.length > 0 && !finalTranscript.endsWith(' ') && !finalTranscript.endsWith('\n')) {
+          finalTranscript += ' ';
+        }
+        finalTranscript += piece.trim();
+        textEditor.value = finalTranscript;
+        updateCounters();
+        // Auto-scroll textarea to bottom
+        textEditor.scrollTop = textEditor.scrollHeight;
       } else {
-        currentInterim += transcriptPiece;
+        currentInterim += piece;
       }
     }
 
     interimTranscript = currentInterim;
 
-    // Detect language from incoming speech
-    const sampleText = (finalTranscript + ' ' + currentInterim).trim();
-    if (sampleText.length > 0) {
-      const script = analyzeLanguageScript(sampleText);
-      updateLanguageDisplay(script);
+    // Display provisional / interim text separately to avoid text duplication
+    if (interimTranscript.trim().length > 0) {
+      interimStream.classList.remove('hidden');
+      interimText.textContent = interimTranscript;
+    } else {
+      interimStream.classList.add('hidden');
+      interimText.textContent = '';
     }
-
-    renderTranscript();
   };
 
-  recognition.onerror = (event) => {
-    console.error('Speech Recognition Error:', event.error);
-    if (event.error === 'not-allowed') {
-      showToast('Microphone permission was denied. Please allow microphone access in your browser settings.', 'error');
-      stopRecording();
+  rec.onerror = (event) => {
+    console.warn('Speech recognition error:', event.error);
+
+    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+      showToast('Microphone access denied. Please allow microphone permission.', 'error');
+      stopSession();
+    } else if (event.error === 'no-speech') {
+      // Benign silence timeout - keep listening if still in recording state
     } else if (event.error === 'network') {
-      showToast('Network issue with speech recognition engine. Reconnecting...', 'error');
+      showToast('Network issue with speech recognition engine.', 'warning');
     }
   };
 
-  recognition.onend = () => {
-    // If the user hasn't explicitly clicked stop, keep listening (auto-restart keepalive)
-    if (isRecording) {
+  rec.onend = () => {
+    // If not intentionally stopped or paused, automatically restart to maintain session
+    if (appState === 'recording' && !isIntentionalStop) {
       try {
-        recognition.start();
-      } catch (e) {
-        console.warn('Re-start triggered automatically:', e);
+        rec.start();
+      } catch (err) {
+        console.warn('Auto-restart notice:', err);
       }
+    } else if (appState === 'paused') {
+      updateStatus('paused');
+      updateControls();
+      stopTimer();
+      hideInterim();
     } else {
-      stopRecordingUI();
+      updateStatus('stopped');
+      updateControls();
+      stopTimer();
+      hideInterim();
     }
   };
 
-  return true;
+  return rec;
 }
 
-function applyLanguageToRecognition() {
-  if (!recognition) return;
-
-  if (currentLanguageMode === 'auto') {
-    // In auto mode, default to multi-lingual / current detected language
-    if (detectedLanguage === 'ml') {
-      recognition.lang = 'ml-IN';
-    } else if (detectedLanguage === 'ar') {
-      recognition.lang = 'ar-SA';
-    } else {
-      recognition.lang = 'en-US';
-    }
-  } else {
-    recognition.lang = currentLanguageMode;
-  }
+function hideInterim() {
+  interimTranscript = '';
+  interimStream.classList.add('hidden');
+  interimText.textContent = '';
 }
 
 // -------------------------------------------------------------
-// 3. Audio Visualizer (Web Audio API)
+// 3. Audio & Session Controls (Start, Pause, Resume, Stop)
 // -------------------------------------------------------------
 
-async function startAudioStream() {
-  try {
-    microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    analyserNode = audioContext.createAnalyser();
-    analyserNode.fftSize = 64;
-    
-    const source = audioContext.createMediaStreamSource(microphoneStream);
-    source.connect(analyserNode);
-
-    drawVisualizer();
-  } catch (err) {
-    console.error('Microphone Access Error:', err);
-    showToast('Unable to access microphone. Please check permissions.', 'error');
-    stopRecording();
-  }
-}
-
-function stopAudioStream() {
-  if (animationFrameId) {
-    cancelAnimationFrame(animationFrameId);
-    animationFrameId = null;
-  }
-  if (microphoneStream) {
-    microphoneStream.getTracks().forEach(track => track.stop());
-    microphoneStream = null;
-  }
-  if (audioContext && audioContext.state !== 'closed') {
-    audioContext.close();
-    audioContext = null;
-  }
-  drawIdleVisualizer();
-}
-
-function drawVisualizer() {
-  if (!analyserNode) return;
-
-  const bufferLength = analyserNode.frequencyBinCount;
-  const dataArray = new Uint8Array(bufferLength);
-
-  const draw = () => {
-    animationFrameId = requestAnimationFrame(draw);
-    analyserNode.getByteFrequencyData(dataArray);
-
-    const width = visualizerCanvas.width;
-    const height = visualizerCanvas.height;
-    canvasCtx.clearRect(0, 0, width, height);
-
-    let sum = 0;
-    const barCount = bufferLength;
-    const barWidth = (width / barCount) - 2;
-
-    for (let i = 0; i < barCount; i++) {
-      const barHeight = (dataArray[i] / 255) * height;
-      sum += dataArray[i];
-
-      // Dynamic color gradient based on frequency
-      const hue = 240 + (i / barCount) * 60; // Indigo to purple gradient
-      canvasCtx.fillStyle = `hsl(${hue}, 85%, 60%)`;
-      canvasCtx.shadowBlur = 6;
-      canvasCtx.shadowColor = `hsl(${hue}, 85%, 50%)`;
-
-      const x = i * (barWidth + 2);
-      const y = height - barHeight;
-
-      // Draw rounded bar
-      canvasCtx.beginPath();
-      canvasCtx.roundRect(x, y, barWidth, barHeight, [2, 2, 0, 0]);
-      canvasCtx.fill();
-    }
-
-    // Calculate approximate RMS / decibels
-    const average = sum / barCount;
-    if (average > 2) {
-      const db = Math.round(20 * Math.log10(average / 255));
-      decibelLevel.textContent = `${db} dB`;
-      decibelLevel.className = 'text-emerald-400 font-mono';
-    } else {
-      decibelLevel.textContent = '-∞ dB';
-      decibelLevel.className = 'text-slate-500 font-mono';
-    }
-  };
-
-  draw();
-}
-
-function drawIdleVisualizer() {
-  const width = visualizerCanvas.width;
-  const height = visualizerCanvas.height;
-  canvasCtx.clearRect(0, 0, width, height);
-
-  // Draw flat subtle center line
-  canvasCtx.strokeStyle = 'rgba(99, 102, 241, 0.2)';
-  canvasCtx.lineWidth = 2;
-  canvasCtx.beginPath();
-  canvasCtx.moveTo(0, height / 2);
-  canvasCtx.lineTo(width, height / 2);
-  canvasCtx.stroke();
-
-  decibelLevel.textContent = '-∞ dB';
-  decibelLevel.className = 'text-slate-500 font-mono';
-}
-
-// -------------------------------------------------------------
-// 4. Recording Controls & Timer
-// -------------------------------------------------------------
-
-async function startRecording() {
+function startSession() {
   if (!recognition) {
-    const initialized = initSpeechRecognition();
-    if (!initialized) return;
+    recognition = initSpeechRecognition();
+    if (!recognition) return;
   }
+
+  isIntentionalStop = false;
+  recognition.lang = languageSelect.value;
+  applyTextDirection(languageSelect.value);
 
   try {
-    await startAudioStream();
     recognition.start();
+    showToast('Microphone active. Listening...', 'info');
   } catch (err) {
-    console.error('Error starting recognition:', err);
+    console.warn('Recognition start caught:', err);
   }
 }
 
-function stopRecording() {
-  isRecording = false;
-  if (recognition) {
-    try {
-      recognition.stop();
-    } catch (e) {
-      console.warn(e);
-    }
-  }
-  stopAudioStream();
-  stopRecordingUI();
-}
+function pauseSession() {
+  if (appState !== 'recording') return;
 
-function stopRecordingUI() {
-  document.body.classList.remove('is-recording');
-  statusText.textContent = 'Paused / Ready';
-  statusBadge.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-800/80 border border-slate-700/60 text-slate-300';
-  
-  micActionHeading.textContent = 'Click to Resume Recording';
-  micActionSub.textContent = 'Press Start or Mic to continue speaking';
-  micIcon.setAttribute('data-lucide', 'mic');
-  lucide.createIcons();
+  appState = 'paused';
+  isIntentionalStop = true;
 
-  if (startBtn) {
-    startBtn.disabled = false;
-  }
-  if (pauseBtn) {
-    pauseBtn.disabled = true;
-    pauseBtn.classList.add('opacity-40', 'cursor-not-allowed');
-    pauseBtn.classList.remove('bg-amber-600', 'text-white', 'hover:bg-amber-500', 'border-amber-500');
-    pauseBtn.classList.add('bg-slate-800', 'text-slate-300');
+  try {
+    recognition.stop();
+  } catch (err) {
+    console.warn(err);
   }
 
   stopTimer();
+  updateStatus('paused');
+  updateControls();
+  hideInterim();
+  showToast('Recording paused. Existing text preserved.', 'info');
 }
 
-function toggleRecording() {
-  if (isRecording) {
-    stopRecording();
-  } else {
-    startRecording();
+function resumeSession() {
+  if (appState !== 'paused') return;
+
+  isIntentionalStop = false;
+  recognition.lang = languageSelect.value;
+  applyTextDirection(languageSelect.value);
+
+  try {
+    recognition.start();
+    appState = 'recording';
+    updateControls();
+    updateStatus('listening');
+    startTimer();
+    showToast('Resuming recording...', 'info');
+  } catch (err) {
+    console.warn('Resume error:', err);
   }
 }
+
+function stopSession() {
+  if (appState === 'idle' || appState === 'stopped') return;
+
+  appState = 'stopped';
+  isIntentionalStop = true;
+
+  try {
+    recognition.stop();
+  } catch (err) {
+    console.warn(err);
+  }
+
+  stopTimer();
+  updateStatus('stopped');
+  updateControls();
+  hideInterim();
+  showToast('Recording session stopped.', 'info');
+}
+
+// -------------------------------------------------------------
+// 4. Status Indicator & Button States
+// -------------------------------------------------------------
+
+function updateControls() {
+  if (appState === 'recording') {
+    startBtn.disabled = true;
+    pauseBtn.disabled = false;
+    resumeBtn.disabled = true;
+    stopBtn.disabled = false;
+  } else if (appState === 'paused') {
+    startBtn.disabled = true;
+    pauseBtn.disabled = true;
+    resumeBtn.disabled = false;
+    stopBtn.disabled = false;
+  } else {
+    // 'idle' or 'stopped'
+    startBtn.disabled = false;
+    pauseBtn.disabled = true;
+    resumeBtn.disabled = true;
+    stopBtn.disabled = true;
+  }
+}
+
+function updateStatus(status) {
+  statusDot.className = 'w-2.5 h-2.5 rounded-full transition-all';
+
+  if (status === 'listening') {
+    statusLabel.textContent = 'Listening';
+    statusDot.classList.add('recording-dot');
+    statusPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-900/50 shadow-sm';
+  } else if (status === 'paused') {
+    statusLabel.textContent = 'Paused';
+    statusDot.classList.add('bg-amber-500');
+    statusPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-900/50';
+  } else if (status === 'stopped') {
+    statusLabel.textContent = 'Stopped';
+    statusDot.classList.add('bg-slate-400');
+    statusPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700';
+  } else if (status === 'unsupported') {
+    statusLabel.textContent = 'Unsupported';
+    statusDot.classList.add('bg-rose-500');
+    statusPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-rose-100 text-rose-800 border border-rose-300';
+  } else {
+    statusLabel.textContent = 'Ready';
+    statusDot.classList.add('bg-emerald-500');
+    statusPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700';
+  }
+}
+
+// -------------------------------------------------------------
+// 5. Timer System (MM:SS)
+// -------------------------------------------------------------
 
 function startTimer() {
-  stopTimer();
-  recordingStartTime = Date.now();
+  if (timerInterval) return;
   timerInterval = setInterval(() => {
-    const elapsedSeconds = Math.floor((Date.now() - recordingStartTime) / 1000);
-    const minutes = String(Math.floor(elapsedSeconds / 60)).padStart(2, '0');
-    const seconds = String(elapsedSeconds % 60).padStart(2, '0');
-    timerDisplay.textContent = `${minutes}:${seconds}`;
+    elapsedSeconds++;
+    renderTimer();
   }, 1000);
 }
 
@@ -440,298 +332,256 @@ function stopTimer() {
   }
 }
 
-// -------------------------------------------------------------
-// 5. Transcript Rendering & Sync
-// -------------------------------------------------------------
-
-function renderTranscript() {
-  const hasText = (finalTranscript.trim().length > 0) || (interimTranscript.trim().length > 0);
-
-  if (hasText) {
-    emptyPlaceholder.classList.add('hidden');
-    transcriptContent.classList.remove('hidden');
-  } else {
-    emptyPlaceholder.classList.remove('hidden');
-    transcriptContent.classList.add('hidden');
-    interimPreview.classList.add('hidden');
-  }
-
-  // Set the finalized text inside editable container
-  // Only update innerText if not focused to avoid messing up manual cursor placement
-  if (document.activeElement !== transcriptContent) {
-    transcriptContent.innerText = finalTranscript;
-  }
-
-  // Display interim stream preview
-  if (interimTranscript.trim().length > 0) {
-    interimPreview.classList.remove('hidden');
-    interimPreview.textContent = interimTranscript + ' ❚';
-  } else {
-    interimPreview.classList.add('hidden');
-    interimPreview.textContent = '';
-  }
-
-  // Auto-scroll to bottom of container
-  transcriptScrollContainer.scrollTop = transcriptScrollContainer.scrollHeight;
-
-  // Update counts
-  updateStats();
+function resetTimer() {
+  stopTimer();
+  elapsedSeconds = 0;
+  renderTimer();
 }
 
-function updateStats() {
-  const currentTotal = (transcriptContent.innerText || finalTranscript).trim();
-  charCountEl.textContent = currentTotal.length;
-  
-  const words = currentTotal.length > 0 ? currentTotal.split(/\s+/).filter(Boolean).length : 0;
-  wordCountEl.textContent = words;
+function renderTimer() {
+  const m = String(Math.floor(elapsedSeconds / 60)).padStart(2, '0');
+  const s = String(elapsedSeconds % 60).padStart(2, '0');
+  timerDisplay.textContent = `${m}:${s}`;
 }
 
-// Sync edits made directly in contenteditable element
-transcriptContent.addEventListener('input', () => {
-  finalTranscript = transcriptContent.innerText;
-  const script = analyzeLanguageScript(finalTranscript);
-  updateLanguageDisplay(script);
-  updateStats();
+// -------------------------------------------------------------
+// 6. Language Selection & Text Direction
+// -------------------------------------------------------------
+
+function applyTextDirection(langCode) {
+  // RTL languages: Arabic (ar-SA), Urdu (ur-PK)
+  if (langCode === 'ar-SA' || langCode === 'ur-PK') {
+    textEditor.setAttribute('dir', 'rtl');
+    interimStream.setAttribute('dir', 'rtl');
+    textEditor.classList.add('font-arabic');
+    textEditor.classList.remove('font-malayalam');
+  } else if (langCode === 'ml-IN') {
+    textEditor.setAttribute('dir', 'ltr');
+    interimStream.setAttribute('dir', 'ltr');
+    textEditor.classList.add('font-malayalam');
+    textEditor.classList.remove('font-arabic');
+  } else {
+    textEditor.setAttribute('dir', 'ltr');
+    interimStream.setAttribute('dir', 'ltr');
+    textEditor.classList.remove('font-malayalam', 'font-arabic');
+  }
+}
+
+languageSelect.addEventListener('change', () => {
+  const selectedLang = languageSelect.value;
+  applyTextDirection(selectedLang);
+
+  if (recognition) {
+    recognition.lang = selectedLang;
+    // If currently recording, restart seamlessly to switch the acoustic/language model
+    if (appState === 'recording') {
+      try {
+        recognition.stop();
+      } catch (e) {}
+    }
+  }
+
+  showToast(`Language set to ${languageSelect.options[languageSelect.selectedIndex].text}`, 'info');
 });
 
 // -------------------------------------------------------------
-// 6. Action Handlers (Copy, Clear, Download PDF)
+// 7. Word & Character Counters
 // -------------------------------------------------------------
 
-// Copy to Clipboard
+function updateCounters() {
+  const text = textEditor.value;
+
+  // Total words: split by whitespace, filter empty tokens
+  const words = text.trim().length > 0 ? text.trim().split(/\s+/).filter(Boolean).length : 0;
+  totalWordsEl.textContent = words.toLocaleString();
+
+  // Total characters (including spaces)
+  totalCharsEl.textContent = text.length.toLocaleString();
+
+  // Total characters (excluding spaces)
+  const noSpaces = text.replace(/\s/g, '').length;
+  totalCharsNoSpaceEl.textContent = noSpaces.toLocaleString();
+}
+
+// Synchronize manual typing in textarea with internal state
+textEditor.addEventListener('input', () => {
+  finalTranscript = textEditor.value;
+  updateCounters();
+});
+
+// -------------------------------------------------------------
+// 8. Action Buttons (Copy, Download TXT, Clear, Select All)
+// -------------------------------------------------------------
+
+// Copy Text
 copyBtn.addEventListener('click', async () => {
-  const text = (transcriptContent.innerText || finalTranscript).trim();
+  const text = textEditor.value.trim();
   if (!text) {
-    showToast('There is no transcript text to copy!', 'warning');
+    showToast('There is no text to copy!', 'warning');
     return;
   }
 
   try {
     await navigator.clipboard.writeText(text);
-    copyBtnText.textContent = 'Copied to Clipboard!';
+    copyBtnText.textContent = 'Copied!';
     copyIcon.setAttribute('data-lucide', 'check');
-    copyBtn.classList.add('bg-emerald-600', 'text-white', 'border-emerald-500');
+    copyBtn.classList.add('bg-emerald-50', 'text-emerald-700', 'border-emerald-300', 'dark:bg-emerald-950/50', 'dark:text-emerald-300');
     lucide.createIcons();
 
-    showToast('Transcript copied to clipboard!', 'success');
+    showToast('Text copied to clipboard!', 'success');
 
     setTimeout(() => {
-      copyBtnText.textContent = 'Copy to Clipboard';
+      copyBtnText.textContent = 'Copy Text';
       copyIcon.setAttribute('data-lucide', 'copy');
-      copyBtn.classList.remove('bg-emerald-600', 'text-white', 'border-emerald-500');
+      copyBtn.classList.remove('bg-emerald-50', 'text-emerald-700', 'border-emerald-300', 'dark:bg-emerald-950/50', 'dark:text-emerald-300');
       lucide.createIcons();
-    }, 2200);
+    }, 2000);
   } catch (err) {
-    console.error('Failed to copy: ', err);
-    showToast('Failed to copy to clipboard.', 'error');
+    console.error('Clipboard copy failed:', err);
+    showToast('Failed to copy text.', 'error');
   }
 });
 
-// Download as .TXT File
-if (downloadTxtBtn) {
-  downloadTxtBtn.addEventListener('click', () => {
-    const text = (transcriptContent.innerText || finalTranscript).trim();
-    if (!text) {
-      showToast('There is no transcript text to download!', 'warning');
-      return;
-    }
-
-    const now = new Date();
-    const dateStr = now.toISOString().slice(0, 10);
-    const timeStr = now.toTimeString().slice(0, 8).replace(/:/g, '-');
-    const filename = `transcript_${dateStr}_${timeStr}.txt`;
-
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-    const downloadUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = downloadUrl;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(downloadUrl);
-
-    showToast('Downloaded .txt transcript successfully!', 'success');
-  });
-}
-
-// Clear Transcript
-clearBtn.addEventListener('click', () => {
-  const text = (transcriptContent.innerText || finalTranscript).trim();
-  if (!text) return;
-
-  if (confirm('Are you sure you want to clear the transcript?')) {
-    finalTranscript = '';
-    interimTranscript = '';
-    transcriptContent.innerText = '';
-    interimPreview.innerText = '';
-    updateLanguageDisplay('en');
-    renderTranscript();
-    timerDisplay.textContent = '00:00';
-    showToast('Transcript cleared.', 'info');
-  }
-});
-
-// Download as PDF (Guaranteed Unicode accuracy for Arabic & Malayalam)
-downloadPdfBtn.addEventListener('click', () => {
-  const text = (transcriptContent.innerText || finalTranscript).trim();
+// Download TXT
+downloadTxtBtn.addEventListener('click', () => {
+  const text = textEditor.value.trim();
   if (!text) {
-    showToast('No transcript available to download as PDF.', 'warning');
+    showToast('Editor is empty. Nothing to download!', 'warning');
     return;
   }
 
-  downloadPdfBtn.disabled = true;
-  downloadPdfBtn.innerHTML = `<span class="inline-block animate-spin mr-1">◌</span> Exporting PDF...`;
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10);
+  const timeStr = now.toTimeString().slice(0, 8).replace(/:/g, '-');
+  const filename = `VoiceType_Transcript_${dateStr}_${timeStr}.txt`;
 
-  try {
-    const pdfTemplate = document.getElementById('pdfExportTemplate');
-    const pdfTranscriptContent = document.getElementById('pdfTranscriptContent');
-    const pdfDate = document.getElementById('pdfDate');
-    const pdfLang = document.getElementById('pdfLang');
-    const pdfStats = document.getElementById('pdfStats');
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const downloadUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = downloadUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(downloadUrl);
 
-    // Populate metadata
-    const now = new Date();
-    pdfDate.textContent = now.toLocaleDateString() + ' ' + now.toLocaleTimeString();
-    
-    let langLabel = 'English';
-    if (detectedLanguage === 'ml') langLabel = 'Malayalam (മലയാളം)';
-    if (detectedLanguage === 'ar') langLabel = 'Arabic (العربية)';
-    pdfLang.textContent = langLabel;
+  showToast('Transcript downloaded as .txt file!', 'success');
+});
 
-    pdfTranscriptContent.textContent = text;
-    
-    // Set proper script direction and font for the PDF document
-    if (detectedLanguage === 'ar') {
-      pdfTranscriptContent.setAttribute('dir', 'rtl');
-      pdfTranscriptContent.style.textAlign = 'right';
-      pdfTranscriptContent.style.fontFamily = "'Noto Sans Arabic', Tahoma, sans-serif";
-    } else if (detectedLanguage === 'ml') {
-      pdfTranscriptContent.setAttribute('dir', 'ltr');
-      pdfTranscriptContent.style.textAlign = 'left';
-      pdfTranscriptContent.style.fontFamily = "'Noto Sans Malayalam', sans-serif";
-    } else {
-      pdfTranscriptContent.setAttribute('dir', 'ltr');
-      pdfTranscriptContent.style.textAlign = 'left';
-      pdfTranscriptContent.style.fontFamily = "'Inter', sans-serif";
-    }
+// Clear Text
+clearBtn.addEventListener('click', () => {
+  if (!textEditor.value.trim()) return;
 
-    const words = text.split(/\s+/).filter(Boolean).length;
-    pdfStats.textContent = `Words: ${words} | Characters: ${text.length}`;
-
-    // PDF Export Options
-    const opt = {
-      margin:       [12, 12, 12, 12],
-      filename:     `VoxScribe_Transcript_${now.toISOString().slice(0, 10)}.pdf`,
-      image:        { type: 'jpeg', quality: 0.98 },
-      html2canvas:  { scale: 2, useCORS: true, logging: false },
-      jsPDF:        { unit: 'mm', format: 'a4', orientation: 'portrait' }
-    };
-
-    html2pdf().set(opt).from(pdfTemplate).save().then(() => {
-      showToast('PDF downloaded successfully!', 'success');
-      resetPdfButton();
-    }).catch(err => {
-      console.error('PDF Generation Error:', err);
-      showToast('Error generating PDF.', 'error');
-      resetPdfButton();
-    });
-
-  } catch (error) {
-    console.error('PDF error:', error);
-    showToast('Failed to generate PDF.', 'error');
-    resetPdfButton();
+  if (confirm('Are you sure you want to clear the entire text editor?')) {
+    textEditor.value = '';
+    finalTranscript = '';
+    hideInterim();
+    resetTimer();
+    updateCounters();
+    showToast('Text editor cleared.', 'info');
   }
 });
 
-function resetPdfButton() {
-  downloadPdfBtn.disabled = false;
-  downloadPdfBtn.innerHTML = `<i data-lucide="download" class="w-3.5 h-3.5"></i><span>Download PDF</span>`;
+// Select All
+selectAllBtn.addEventListener('click', () => {
+  if (!textEditor.value.trim()) {
+    showToast('Text editor is empty.', 'info');
+    return;
+  }
+  textEditor.focus();
+  textEditor.select();
+  showToast('All text selected.', 'info');
+});
+
+// -------------------------------------------------------------
+// 9. Button Event Listeners
+// -------------------------------------------------------------
+
+startBtn.addEventListener('click', () => {
+  resetTimer();
+  startSession();
+});
+
+pauseBtn.addEventListener('click', () => {
+  pauseSession();
+});
+
+resumeBtn.addEventListener('click', () => {
+  resumeSession();
+});
+
+stopBtn.addEventListener('click', () => {
+  stopSession();
+});
+
+// -------------------------------------------------------------
+// 10. Keyboard Shortcuts
+// -------------------------------------------------------------
+
+document.addEventListener('keydown', (e) => {
+  // Ctrl + Enter (or Cmd + Enter): Toggle Start/Resume or Pause
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    if (appState === 'recording') {
+      pauseSession();
+    } else if (appState === 'paused') {
+      resumeSession();
+    } else {
+      resetTimer();
+      startSession();
+    }
+  }
+
+  // Ctrl + Shift + C (or Cmd + Shift + C): Copy Text
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
+    e.preventDefault();
+    copyBtn.click();
+  }
+});
+
+// -------------------------------------------------------------
+// 11. Light / Dark Theme Toggle
+// -------------------------------------------------------------
+
+function applyTheme(isDark) {
+  if (isDark) {
+    document.documentElement.classList.add('dark');
+    document.documentElement.classList.remove('light');
+    themeIcon.setAttribute('data-lucide', 'sun');
+    localStorage.setItem('voicetype_theme', 'dark');
+  } else {
+    document.documentElement.classList.remove('dark');
+    document.documentElement.classList.add('light');
+    themeIcon.setAttribute('data-lucide', 'moon');
+    localStorage.setItem('voicetype_theme', 'light');
+  }
   lucide.createIcons();
 }
 
-// -------------------------------------------------------------
-// 7. Language Switcher Tabs
-// -------------------------------------------------------------
-
-function setLanguageMode(mode) {
-  currentLanguageMode = mode;
-
-  langTabs.forEach(tab => {
-    if (tab.dataset.lang === mode) {
-      tab.classList.add('active');
-    } else {
-      tab.classList.remove('active');
-    }
-  });
-
-  if (mobileLangSelect) {
-    mobileLangSelect.value = mode;
-  }
-
-  if (mode === 'auto') {
-    showToast('Switched to Auto-Detect mode.', 'info');
-  } else if (mode === 'ml-IN') {
-    updateLanguageDisplay('ml');
-    showToast('Language set to Malayalam.', 'info');
-  } else if (mode === 'ar-SA') {
-    updateLanguageDisplay('ar');
-    showToast('Language set to Arabic.', 'info');
-  } else if (mode === 'en-US') {
-    updateLanguageDisplay('en');
-    showToast('Language set to English.', 'info');
-  }
-
-  applyLanguageToRecognition();
-
-  // If currently recording, restart recognition seamlessly to apply new language model
-  if (isRecording && recognition) {
-    try {
-      recognition.stop();
-    } catch (e) {}
-  }
-}
-
-langTabs.forEach(tab => {
-  tab.addEventListener('click', () => {
-    setLanguageMode(tab.dataset.lang);
-  });
+themeToggleBtn.addEventListener('click', () => {
+  const isCurrentlyDark = document.documentElement.classList.contains('dark');
+  applyTheme(!isCurrentlyDark);
 });
 
-if (mobileLangSelect) {
-  mobileLangSelect.addEventListener('change', (e) => {
-    setLanguageMode(e.target.value);
-  });
-}
-
 // -------------------------------------------------------------
-// 8. Event Listeners & Bootstrapping
+// 12. Bootstrapping
 // -------------------------------------------------------------
 
-toggleRecordBtn.addEventListener('click', toggleRecording);
-
-if (startBtn) {
-  startBtn.addEventListener('click', () => {
-    if (!isRecording) {
-      startRecording();
-    }
-  });
-}
-
-if (pauseBtn) {
-  pauseBtn.addEventListener('click', () => {
-    if (isRecording) {
-      stopRecording();
-      showToast('Recording paused.', 'info');
-    }
-  });
-}
-
-// Initialize icons and visualizer on page load
 window.addEventListener('DOMContentLoaded', () => {
   lucide.createIcons();
-  drawIdleVisualizer();
-  initSpeechRecognition();
-  updateLanguageDisplay('en');
-});
 
+  // Load saved theme (default to light mode as requested in specifications)
+  const savedTheme = localStorage.getItem('voicetype_theme') || 'light';
+  applyTheme(savedTheme === 'dark');
+
+  // Set initial language & direction
+  applyTextDirection(languageSelect.value);
+
+  // Initialize controls & counters
+  updateControls();
+  updateStatus('ready');
+  updateCounters();
+
+  // Pre-initialize speech recognition
+  recognition = initSpeechRecognition();
+});
