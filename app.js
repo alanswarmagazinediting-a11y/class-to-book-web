@@ -2,16 +2,15 @@
  * VoiceType – Live Speech to Text
  * Pure Vanilla JavaScript implementation of Web Speech API
  * 
- * Features:
- * - Direct, rock-solid SpeechRecognition lifecycle with zero hardware conflicts
- * - Live Diagnostic Debugging Panel (mic permission, audio capture, speech detection, onresult, onerror)
- * - Immediate text insertion in textarea (interim + final)
- * - Fixed primary language: Malayalam (ml-IN)
- * - Multi-language support: Malayalam, Arabic (ar-SA), English (en-US)
- * - Start, Pause, Resume, Stop controls with session continuity
- * - Word & Character Counters (Words, Chars, Chars excluding spaces)
- * - Copy Text, Download TXT, Clear Text, Select All
- * - MM:SS Timer, Light/Dark Mode, and Keyboard Shortcuts
+ * Zero-Duplication Architecture:
+ * - Separates persisted transcript (from previous sessions/manual edits) from
+ *   the current recognition session's results.
+ * - In onresult, reconstructs sessionFinal from event.results directly.
+ *   This ensures each finalized phrase is counted exactly once, completely
+ *   eliminating cumulative word duplication ("Hello Hello Hello Hello").
+ * - In-flight interim speech is rendered dynamically without permanent commitment.
+ * - Supports Malayalam (ml-IN, Primary), Arabic (ar-SA, Secondary), and English (en-US, Tertiary).
+ * - Full session continuity across Pause, Resume, Stop, and Auto-Restart.
  */
 
 // Supported Languages Configuration
@@ -31,15 +30,19 @@ const SCRIPT_PATTERNS = {
 // Application State
 let recognition = null;
 let appState = 'idle'; // 'idle' | 'recording' | 'paused' | 'stopped'
-let activeMode = 'ml-IN'; // Fixed Malayalam by default as requested in debugging step
-let currentLangCode = 'ml-IN'; // Fixed Malayalam
+let activeMode = 'auto'; // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
+let currentLangCode = 'ml-IN'; // Default Malayalam (Primary)
 let detectedLang = LANG_CONFIG.MALAYALAM;
 
-let finalTranscript = '';
-let interimTranscript = '';
+// Transcript Memory Model (Guarantees ZERO duplicate words)
+let persistedTranscript = ''; // Text from previous sessions or manual typing
+let sessionFinal = '';        // Finalized text in the CURRENT active recognition session
+let sessionInterim = '';      // Provisional unfinalized speech in CURRENT active session
+
 let isIntentionalStop = false;
 let isRestarting = false;
 let resultCount = 0;
+let consecutiveEnglishTokens = 0;
 
 // Timer State
 let timerInterval = null;
@@ -124,7 +127,7 @@ function showToast(message, type = 'success') {
   toast.classList.add('show');
   toastTimeout = setTimeout(() => {
     toast.classList.remove('show');
-  }, 3000);
+  }, 2800);
 }
 
 // -------------------------------------------------------------
@@ -162,7 +165,115 @@ function updateMicPermissionUI(state) {
 }
 
 // -------------------------------------------------------------
-// 3. Web Speech API Lifecycle & Engine Management
+// 3. Language Detection & Hysteresis Controller
+// -------------------------------------------------------------
+
+/**
+ * Evaluates spoken phrase for Malayalam, Arabic, or English
+ * Applies hysteresis to ignore 1-2 isolated English loanwords in Malayalam
+ */
+function evaluateSpokenLanguage(phrase) {
+  if (!phrase || phrase.trim().length === 0) return null;
+
+  const hasMalayalam = SCRIPT_PATTERNS.malayalam.test(phrase);
+  const hasArabic = SCRIPT_PATTERNS.arabic.test(phrase);
+  const englishMatches = phrase.match(/[a-zA-Z]+/g) || [];
+
+  // 1. Arabic: High confidence on Arabic script
+  if (hasArabic) {
+    consecutiveEnglishTokens = 0;
+    return LANG_CONFIG.ARABIC;
+  }
+
+  // 2. Malayalam: Highest priority
+  if (hasMalayalam) {
+    consecutiveEnglishTokens = 0;
+    return LANG_CONFIG.MALAYALAM;
+  }
+
+  // 3. English Hysteresis Check:
+  // Malayalam speakers frequently use single English loanwords (e.g., "school", "bus", "time", "class").
+  // Do NOT switch if there is only 1 or 2 isolated English words while in Malayalam mode.
+  if (englishMatches.length > 0) {
+    consecutiveEnglishTokens += englishMatches.length;
+
+    // Switch only after 3+ consecutive English words without Malayalam
+    if (consecutiveEnglishTokens >= 3) {
+      return LANG_CONFIG.ENGLISH;
+    }
+  } else {
+    consecutiveEnglishTokens = 0;
+  }
+
+  return null;
+}
+
+function updateLanguageUI(langObj) {
+  detectedLang = langObj;
+  detectedLangName.textContent = langObj.name;
+  detectedLangBadge.textContent = langObj.badge;
+
+  if (dbgLang) {
+    dbgLang.textContent = `${langObj.code} (${langObj.name})`;
+  }
+
+  if (langObj.code === LANG_CONFIG.MALAYALAM.code) {
+    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-800 dark:text-emerald-300 shadow-sm transition-all';
+    detectedLangDot.className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
+    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300 ml-0.5';
+  } else if (langObj.code === LANG_CONFIG.ARABIC.code) {
+    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-300 shadow-sm transition-all';
+    detectedLangDot.className = 'w-2 h-2 rounded-full bg-amber-500 animate-pulse';
+    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300 ml-0.5';
+  } else {
+    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800/60 text-sky-800 dark:text-sky-300 shadow-sm transition-all';
+    detectedLangDot.className = 'w-2 h-2 rounded-full bg-sky-500 animate-pulse';
+    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-sky-100 dark:bg-sky-900/60 text-sky-700 dark:text-sky-300 ml-0.5';
+  }
+}
+
+function commitSessionText() {
+  if (sessionFinal.trim()) {
+    if (persistedTranscript && !persistedTranscript.endsWith(' ') && !persistedTranscript.endsWith('\n')) {
+      persistedTranscript += ' ';
+    }
+    persistedTranscript += sessionFinal.trim();
+  }
+  sessionFinal = '';
+  sessionInterim = '';
+}
+
+function switchLanguage(newCode, isUserClick = false) {
+  if (currentLangCode === newCode && !isUserClick) return;
+
+  // Commit current session text before language change
+  commitSessionText();
+
+  currentLangCode = newCode;
+  const langObj = Object.values(LANG_CONFIG).find(l => l.code === newCode) || LANG_CONFIG.MALAYALAM;
+  updateLanguageUI(langObj);
+
+  if (recognition) {
+    recognition.lang = newCode;
+
+    // If currently recording, safely restart with the new language model
+    if (appState === 'recording' && !isRestarting) {
+      isRestarting = true;
+      try {
+        recognition.stop();
+      } catch (e) {
+        isRestarting = false;
+      }
+    }
+  }
+
+  if (isUserClick) {
+    showToast(`Language set to ${langObj.name}`, 'info');
+  }
+}
+
+// -------------------------------------------------------------
+// 4. Web Speech API Lifecycle & Engine Management
 // -------------------------------------------------------------
 
 function initSpeechRecognition() {
@@ -236,31 +347,60 @@ function initSpeechRecognition() {
     }
   };
 
-  // Speech Recognition Result Event (THE CORE ENGINE)
+  // -----------------------------------------------------------
+  // ZERO-DUPLICATION SPEECH EVENT HANDLER (CRITICAL LOGIC)
+  // -----------------------------------------------------------
   rec.onresult = (event) => {
+    let currentFinal = '';
     let currentInterim = '';
 
-    for (let i = event.resultIndex; i < event.results.length; ++i) {
-      const piece = event.results[i][0].transcript;
+    // Reconstruct this session's speech directly from event.results
+    // This guarantees that each finalized phrase is counted exactly ONCE
+    for (let i = 0; i < event.results.length; ++i) {
+      const result = event.results[i];
+      const transcriptPiece = result[0].transcript;
 
-      if (event.results[i].isFinal) {
-        // Append finalized text with proper spacing
-        if (finalTranscript.length > 0 && !finalTranscript.endsWith(' ') && !finalTranscript.endsWith('\n')) {
-          finalTranscript += ' ';
+      if (result.isFinal) {
+        currentFinal += transcriptPiece.trim() + ' ';
+
+        // Check for automatic language detection on final results
+        if (activeMode === 'auto') {
+          const detected = evaluateSpokenLanguage(transcriptPiece);
+          if (detected && detected.code !== currentLangCode) {
+            switchLanguage(detected.code);
+          }
         }
-        finalTranscript += piece.trim();
-        resultCount++;
       } else {
-        currentInterim += piece;
+        currentInterim += transcriptPiece;
       }
     }
 
-    interimTranscript = currentInterim;
+    sessionFinal = currentFinal;
+    sessionInterim = currentInterim;
+    resultCount = event.results.length;
 
-    // IMMEDIATE INSERTION: Render live transcript directly inside textarea!
-    // Shows finalized text + live in-flight speech without duplicate words
-    const displayValue = finalTranscript + (currentInterim ? (finalTranscript ? ' ' : '') + currentInterim : '');
-    textEditor.value = displayValue;
+    // Combine:
+    // 1. Text from previous sessions or manual typing (persistedTranscript)
+    // 2. Finalized speech in this active session (sessionFinal)
+    // 3. Provisional in-flight speech (sessionInterim)
+    let fullFinalized = persistedTranscript;
+    if (sessionFinal.trim()) {
+      if (fullFinalized && !fullFinalized.endsWith(' ') && !fullFinalized.endsWith('\n')) {
+        fullFinalized += ' ';
+      }
+      fullFinalized += sessionFinal.trim();
+    }
+
+    let liveDisplay = fullFinalized;
+    if (sessionInterim.trim()) {
+      if (liveDisplay && !liveDisplay.endsWith(' ') && !liveDisplay.endsWith('\n')) {
+        liveDisplay += ' ';
+      }
+      liveDisplay += sessionInterim.trim();
+    }
+
+    // Render directly into textarea without cumulative duplication
+    textEditor.value = liveDisplay;
     updateCounters();
 
     // Auto-scroll textarea to bottom so user always sees live speech
@@ -268,8 +408,8 @@ function initSpeechRecognition() {
 
     // Update Live Diagnostic Panel
     if (dbgResult) {
-      const lastSnippet = (currentInterim || finalTranscript).slice(-35);
-      dbgResult.textContent = `Count: ${resultCount} | "${lastSnippet}"`;
+      const snippet = (sessionInterim || sessionFinal || persistedTranscript).slice(-35);
+      dbgResult.textContent = `Count: ${resultCount} | "${snippet}"`;
       dbgResult.className = 'font-semibold text-emerald-400 text-xs mt-0.5 truncate';
     }
   };
@@ -310,6 +450,11 @@ function initSpeechRecognition() {
   rec.onend = () => {
     isRestarting = false;
 
+    // Commit this session's finalized text cleanly before restarting or finishing
+    commitSessionText();
+    textEditor.value = persistedTranscript;
+    updateCounters();
+
     if (dbgStarted) {
       dbgStarted.textContent = 'No (Ended)';
       dbgStarted.className = 'font-bold text-slate-400 text-xs mt-0.5';
@@ -323,7 +468,7 @@ function initSpeechRecognition() {
       dbgSpeech.className = 'font-bold text-slate-400 text-xs mt-0.5';
     }
 
-    // If still in recording mode and not paused or stopped, restart with safe debounce
+    // If still in recording mode and not intentionally stopped/paused, restart with safe debounce
     if (appState === 'recording' && !isIntentionalStop) {
       setTimeout(() => {
         if (appState === 'recording') {
@@ -350,7 +495,7 @@ function initSpeechRecognition() {
 }
 
 // -------------------------------------------------------------
-// 4. Session Controls (Start, Pause, Resume, Stop)
+// 5. Session Controls (Start, Pause, Resume, Stop)
 // -------------------------------------------------------------
 
 function startSession() {
@@ -362,8 +507,10 @@ function startSession() {
   isIntentionalStop = false;
   isRestarting = false;
 
-  // Sync finalTranscript with textarea content before starting
-  finalTranscript = textEditor.value;
+  // Synchronize memory model with current textarea text before starting
+  persistedTranscript = textEditor.value;
+  sessionFinal = '';
+  sessionInterim = '';
 
   // Set language
   recognition.lang = currentLangCode;
@@ -393,6 +540,10 @@ function pauseSession() {
     console.warn(err);
   }
 
+  commitSessionText();
+  textEditor.value = persistedTranscript;
+  updateCounters();
+
   stopTimer();
   updateStatus('paused');
   updateControls();
@@ -403,7 +554,9 @@ function resumeSession() {
   if (appState !== 'paused') return;
 
   isIntentionalStop = false;
-  finalTranscript = textEditor.value;
+  persistedTranscript = textEditor.value;
+  sessionFinal = '';
+  sessionInterim = '';
   recognition.lang = currentLangCode;
 
   try {
@@ -430,6 +583,10 @@ function stopSession() {
     console.warn(err);
   }
 
+  commitSessionText();
+  textEditor.value = persistedTranscript;
+  updateCounters();
+
   stopTimer();
   updateStatus('stopped');
   updateControls();
@@ -437,7 +594,7 @@ function stopSession() {
 }
 
 // -------------------------------------------------------------
-// 5. Controls & Status Indicator Management
+// 6. Controls & Status Indicator Management
 // -------------------------------------------------------------
 
 function updateControls() {
@@ -486,51 +643,8 @@ function updateStatus(status) {
 }
 
 // -------------------------------------------------------------
-// 6. Language Selection & UI Management
+// 7. Language Switch Chips (Auto + 1-Tap Fast Selection)
 // -------------------------------------------------------------
-
-function updateLanguageUI(langObj) {
-  detectedLang = langObj;
-  detectedLangName.textContent = langObj.name;
-  detectedLangBadge.textContent = langObj.badge;
-
-  if (dbgLang) {
-    dbgLang.textContent = `${langObj.code} (${langObj.name})`;
-  }
-
-  if (langObj.code === LANG_CONFIG.MALAYALAM.code) {
-    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-800 dark:text-emerald-300 shadow-sm transition-all';
-    detectedLangDot.className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
-    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300 ml-0.5';
-  } else if (langObj.code === LANG_CONFIG.ARABIC.code) {
-    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-300 shadow-sm transition-all';
-    detectedLangDot.className = 'w-2 h-2 rounded-full bg-amber-500 animate-pulse';
-    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300 ml-0.5';
-  } else {
-    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800/60 text-sky-800 dark:text-sky-300 shadow-sm transition-all';
-    detectedLangDot.className = 'w-2 h-2 rounded-full bg-sky-500 animate-pulse';
-    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-sky-100 dark:bg-sky-900/60 text-sky-700 dark:text-sky-300 ml-0.5';
-  }
-}
-
-function switchLanguage(newCode) {
-  currentLangCode = newCode;
-  const langObj = Object.values(LANG_CONFIG).find(l => l.code === newCode) || LANG_CONFIG.MALAYALAM;
-  updateLanguageUI(langObj);
-
-  if (recognition) {
-    recognition.lang = newCode;
-
-    // If currently recording, safely restart with the new language
-    if (appState === 'recording') {
-      try {
-        recognition.stop();
-      } catch (e) {}
-    }
-  }
-
-  showToast(`Language set to ${langObj.name}`, 'info');
-}
 
 langChips.forEach(chip => {
   chip.addEventListener('click', () => {
@@ -540,16 +654,17 @@ langChips.forEach(chip => {
     const mode = chip.dataset.mode;
     activeMode = mode;
 
-    if (mode === 'auto' || mode === 'ml-IN') {
-      switchLanguage(LANG_CONFIG.MALAYALAM.code);
+    if (mode === 'auto') {
+      switchLanguage(LANG_CONFIG.MALAYALAM.code, true);
+      showToast('Switched to Auto-Detect mode (Malayalam primary).', 'info');
     } else {
-      switchLanguage(mode);
+      switchLanguage(mode, true);
     }
   });
 });
 
 // -------------------------------------------------------------
-// 7. Timer System (MM:SS)
+// 8. Timer System (MM:SS)
 // -------------------------------------------------------------
 
 function startTimer() {
@@ -580,7 +695,7 @@ function renderTimer() {
 }
 
 // -------------------------------------------------------------
-// 8. Word & Character Counters
+// 9. Word & Character Counters
 // -------------------------------------------------------------
 
 function updateCounters() {
@@ -598,14 +713,16 @@ function updateCounters() {
   totalCharsNoSpaceEl.textContent = noSpaces.toLocaleString();
 }
 
-// Synchronize manual typing in textarea with internal state
+// Synchronize manual typing in textarea with memory model
 textEditor.addEventListener('input', () => {
-  finalTranscript = textEditor.value;
+  persistedTranscript = textEditor.value;
+  sessionFinal = '';
+  sessionInterim = '';
   updateCounters();
 });
 
 // -------------------------------------------------------------
-// 9. Action Buttons (Copy, Download TXT, Clear, Select All)
+// 10. Action Buttons (Copy, Download TXT, Clear, Select All)
 // -------------------------------------------------------------
 
 // Copy Text
@@ -669,8 +786,9 @@ clearBtn.addEventListener('click', () => {
 
   if (confirm('Are you sure you want to clear the entire text editor?')) {
     textEditor.value = '';
-    finalTranscript = '';
-    interimTranscript = '';
+    persistedTranscript = '';
+    sessionFinal = '';
+    sessionInterim = '';
     resultCount = 0;
     resetTimer();
     updateCounters();
@@ -691,7 +809,7 @@ selectAllBtn.addEventListener('click', () => {
 });
 
 // -------------------------------------------------------------
-// 10. Button Event Listeners
+// 11. Button Event Listeners
 // -------------------------------------------------------------
 
 startBtn.addEventListener('click', () => {
@@ -712,7 +830,7 @@ stopBtn.addEventListener('click', () => {
 });
 
 // -------------------------------------------------------------
-// 11. Keyboard Shortcuts
+// 12. Keyboard Shortcuts
 // -------------------------------------------------------------
 
 document.addEventListener('keydown', (e) => {
@@ -737,7 +855,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 // -------------------------------------------------------------
-// 12. Light / Dark Theme Toggle
+// 13. Light / Dark Theme Toggle
 // -------------------------------------------------------------
 
 function applyTheme(isDark) {
@@ -761,7 +879,7 @@ themeToggleBtn.addEventListener('click', () => {
 });
 
 // -------------------------------------------------------------
-// 13. Bootstrapping
+// 14. Bootstrapping
 // -------------------------------------------------------------
 
 window.addEventListener('DOMContentLoaded', () => {

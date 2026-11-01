@@ -1,40 +1,34 @@
-# 🎙️ VoiceType – Live Speech to Text (Automatic Language Detection)
+# 🎙️ VoiceType – Live Speech to Text
 
-A modern, professional, fully responsive web application that captures live microphone audio and converts spoken words into editable text in real time with **Intelligent Automatic Language Detection** across **Malayalam**, **Arabic**, and **English**.
+A modern, professional, fully responsive web application that captures live microphone audio and converts spoken words into editable text in real time with **Zero-Duplication Result Processing** and **Intelligent Multilingual Support** across **Malayalam**, **Arabic**, and **English**.
 
 ---
 
-## ✨ Automatic Language Detection Architecture
+## ⚡ Zero-Duplication Architecture
 
-The application removes manual language dropdowns and replaces them with an adaptive multi-language detection engine:
+The result-handling logic uses a clean **Session Memory Model**:
+- **`persistedTranscript`:** Holds all text committed from previous recognition sessions or typed manually by the user.
+- **`sessionFinal`:** Reconstructed directly from `event.results` in the current active session. Each finalized phrase is counted exactly **once**, eliminating cumulative loops (`"Hello Hello Hello Hello"`).
+- **`sessionInterim`:** Real-time temporary in-flight speech displayed dynamically without permanent commitment.
+- When an utterance finalizes, it seamlessly transitions into the transcript without re-appending previous phrases.
+- When recognition pauses, resumes, or auto-reconnects, previous text is preserved 100% and new speech is added cleanly.
 
-### 1. Priority Hierarchy
-- **🟢 Malayalam (`ml-IN`) – Primary & Default (Highest Priority):**
-  - Starts listening in Malayalam by default.
-  - Generates authentic Malayalam script (മലയാളം) with full conjunct (കൂട്ടക്ഷരങ്ങൾ) and chillu (ചില്ലക്ഷരങ്ങൾ) ligatures.
-- **🟡 Arabic (`ar-SA`) – Secondary:**
-  - Generates authentic Arabic script (العربية) with native bidirectional layout (`dir="auto"` / RTL).
-- **🔵 English (`en-US`) – Tertiary:**
-  - Generates English Latin script.
+---
 
-### 2. Intelligent Hysteresis Controller (Loanword Filter)
-- In natural Malayalam speech, speakers frequently use English loanwords (e.g., *"bus"*, *"class"*, *"time"*, *"school"*, *"hospital"*, *"phone"*, *"meeting"*).
-- The Hysteresis Controller prevents erratic language switching: an isolated English word inside Malayalam speech does **not** trigger a language switch.
-- The system only transitions to English when a sustained phrase (3+ consecutive English tokens) is spoken without Malayalam context.
-- Malayalam retains highest priority: any Malayalam utterance immediately re-locks the engine into Malayalam.
+## 🌐 Multi-Language Support
 
-### 3. Continuous Recognition & Zero Data Loss
-- When the detected language changes, previously transcribed text is safely retained in the editor.
-- The status pill dynamically updates in real time:
-  - `🟢 Detected: Malayalam (Primary)`
-  - `🟡 Detected: Arabic (Secondary)`
-  - `🔵 Detected: English (Tertiary)`
+- **🟢 Malayalam (`ml-IN`) – Default & Highest Priority:**
+  - High-precision transcription with authentic Brahmic conjuncts (കൂട്ടക്ഷരങ്ങൾ) and chillu characters (ചില്ലക്ഷരങ്ങൾ).
+- **🟡 Arabic (`ar-SA`) – Secondary Priority:**
+  - Full cursive letter joining with bidirectional layout (`dir="auto"`).
+- **🔵 English (`en-US`) – Tertiary Priority:**
+  - Standard Latin phonetics and punctuation.
 
 ---
 
 ## 🛠️ Complete Feature Set
 
-- **Controls:** Start, Pause, Resume, and Stop with full session state management.
+- **Controls:** Start, Pause, Resume, and Stop with session continuity.
 - **Editable Text Box:** Click anywhere to manually edit, type, insert punctuation, or delete text.
 - **Live Statistics:**
   - Total Words
@@ -45,17 +39,15 @@ The application removes manual language dropdowns and replaces them with an adap
   - **Download TXT:** Instant download as a clean timestamped `.txt` document.
   - **Select All:** One-click selection of the full transcript.
   - **Clear Text:** Safely clears the editor after user confirmation.
+- **Diagnostic Debug Panel:** Real-time visibility into Web Speech API events (`onstart`, `onaudiostart`, `onspeechstart`, `onresult`, `onerror`).
 - **Timer:** Real-time speaking duration in `MM:SS`.
 - **Theme:** Professional light theme by default with a dark mode toggle (`localStorage` persisted).
-- **Shortcuts:**
-  - <kbd>Ctrl</kbd> + <kbd>Enter</kbd>: Start, Resume, or Pause recording.
-  - <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd>: Copy text.
 
 ---
 
 ## 🚀 How to Run Locally
 
-### Option 1: 1-Click Server Launcher
+### Option 1: 1-Click Server Launcher (Recommended)
 Double-click **`start-server.bat`** in this folder. It opens `http://localhost:5000/` automatically in your default browser.
 
 ### Option 2: Direct Open
