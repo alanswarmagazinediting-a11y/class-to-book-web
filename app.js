@@ -692,9 +692,10 @@ function ensureWorker() {
     setErrorDiagnostic('Worker error: ' + (event.message || 'unknown'));
     setModelProgress(0, 'Inference worker failed to start.', true);
     modelLoading = false;
+    modelReady = false;
     loadModelBtn.disabled = false;
     loadModelBtnText.textContent = 'Load Model';
-    if (modelLoadResolve) { modelLoadResolve(false); modelLoadResolve = null; }
+    resolveModelLoad(false);
   };
   return asrWorker;
 }
