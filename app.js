@@ -3,13 +3,13 @@
  * Pure Vanilla JavaScript implementation of Web Speech API
  * 
  * Features:
- * - Intelligent Automatic Language Detection & Adaptive Switching
- *   (Malayalam [Primary/Default], Arabic [Secondary], English [Tertiary])
- * - Hysteresis Controller (Prevents erratic switching on single English loanwords in Malayalam/Arabic)
- * - Original Script Preservation (Malayalam -> Malayalam, Arabic -> Arabic, English -> Latin)
+ * - Direct, rock-solid SpeechRecognition lifecycle (ZERO hardware mic conflicts)
+ * - Intelligent Multilingual Auto-Detection (Malayalam [Primary], Arabic, English)
+ * - Loanword Hysteresis Filter (Preserves Malayalam on single English loanwords)
+ * - Original Script Preservation (Malayalam, Arabic, English)
  * - Start, Pause, Resume, Stop controls with session continuity
- * - Word & Character Counters (Total Words, Total Chars, Chars excluding spaces)
- * - Copy to Clipboard, Download TXT, Clear Text, Select All
+ * - Word & Character Counters (Words, Chars, Chars excluding spaces)
+ * - Copy Text, Download TXT, Clear Text, Select All
  * - MM:SS Timer, Light/Dark Mode, and Keyboard Shortcuts
  */
 
@@ -27,23 +27,18 @@ const SCRIPT_PATTERNS = {
   english:   /[a-zA-Z]/
 };
 
-// State Variables
+// Application State
 let recognition = null;
 let appState = 'idle'; // 'idle' | 'recording' | 'paused' | 'stopped'
-let currentLangCode = LANG_CONFIG.MALAYALAM.code; // Default = Malayalam (Primary)
+let activeMode = 'auto'; // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
+let currentLangCode = LANG_CONFIG.MALAYALAM.code; // Default = Malayalam
 let detectedLang = LANG_CONFIG.MALAYALAM;
 
 let finalTranscript = '';
 let interimTranscript = '';
 let isIntentionalStop = false;
-
-// Audio Activity & Fallback Prober (Web Audio API)
-let audioContext = null;
-let analyserNode = null;
-let micStream = null;
-let audioEnergy = 0;
-let consecutiveSilenceCount = 0;
 let consecutiveEnglishTokens = 0;
+let isRestarting = false;
 
 // Timer State
 let timerInterval = null;
@@ -63,6 +58,7 @@ const detectedLangPill = document.getElementById('detectedLangPill');
 const detectedLangDot = document.getElementById('detectedLangDot');
 const detectedLangName = document.getElementById('detectedLangName');
 const detectedLangBadge = document.getElementById('detectedLangBadge');
+const langChips = document.querySelectorAll('.lang-chip');
 
 const statusPill = document.getElementById('statusPill');
 const statusDot = document.getElementById('statusDot');
@@ -117,16 +113,16 @@ function showToast(message, type = 'success') {
   toast.classList.add('show');
   toastTimeout = setTimeout(() => {
     toast.classList.remove('show');
-  }, 2600);
+  }, 2800);
 }
 
 // -------------------------------------------------------------
-// 2. Automatic Language Detection & Hysteresis Controller
+// 2. Language Detection & Hysteresis Controller
 // -------------------------------------------------------------
 
 /**
- * Analyzes string content to detect if it contains Malayalam, Arabic, or English.
- * Incorporates a hysteresis threshold to avoid switching on single loanwords.
+ * Evaluates spoken phrase for Malayalam, Arabic, or English
+ * Applies hysteresis to ignore 1-2 isolated English loanwords in Malayalam
  */
 function evaluateSpokenLanguage(phrase) {
   if (!phrase || phrase.trim().length === 0) return null;
@@ -135,13 +131,13 @@ function evaluateSpokenLanguage(phrase) {
   const hasArabic = SCRIPT_PATTERNS.arabic.test(phrase);
   const englishMatches = phrase.match(/[a-zA-Z]+/g) || [];
 
-  // 1. Arabic Detection: High confidence if Arabic script is present
+  // 1. Arabic: High confidence on Arabic script
   if (hasArabic) {
     consecutiveEnglishTokens = 0;
     return LANG_CONFIG.ARABIC;
   }
 
-  // 2. Malayalam Detection: If Malayalam script is present, keep/set Malayalam (Highest Priority)
+  // 2. Malayalam: Highest priority
   if (hasMalayalam) {
     consecutiveEnglishTokens = 0;
     return LANG_CONFIG.MALAYALAM;
@@ -153,7 +149,7 @@ function evaluateSpokenLanguage(phrase) {
   if (englishMatches.length > 0) {
     consecutiveEnglishTokens += englishMatches.length;
 
-    // Only switch to English if 3 or more consecutive English tokens occur without Malayalam
+    // Switch only after 3+ consecutive English words without Malayalam
     if (consecutiveEnglishTokens >= 3) {
       return LANG_CONFIG.ENGLISH;
     }
@@ -165,16 +161,10 @@ function evaluateSpokenLanguage(phrase) {
 }
 
 /**
- * Updates UI language badge and dynamically changes speech recognition model
+ * Updates UI badge for detected language
  */
-function setDetectedLanguage(langObj, reason = 'auto') {
-  if (!langObj) return;
-
-  const isChanged = detectedLang.code !== langObj.code;
+function updateLanguageUI(langObj) {
   detectedLang = langObj;
-  currentLangCode = langObj.code;
-
-  // Update UI Status Indicator (Requirement #10)
   detectedLangName.textContent = langObj.name;
   detectedLangBadge.textContent = langObj.badge;
 
@@ -187,27 +177,39 @@ function setDetectedLanguage(langObj, reason = 'auto') {
     detectedLangDot.className = 'w-2 h-2 rounded-full bg-amber-500 animate-pulse';
     detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300 ml-0.5';
   } else {
-    // English
     detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800/60 text-sky-800 dark:text-sky-300 shadow-sm transition-all';
     detectedLangDot.className = 'w-2 h-2 rounded-full bg-sky-500 animate-pulse';
     detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-sky-100 dark:bg-sky-900/60 text-sky-700 dark:text-sky-300 ml-0.5';
   }
+}
 
-  // If the language changed while actively recording, switch the recognition engine seamlessly
-  if (isChanged && appState === 'recording' && recognition) {
-    try {
-      recognition.lang = langObj.code;
-      // Restart recognition to bind to the new acoustic/language model
-      isIntentionalStop = false;
-      recognition.stop();
-    } catch (e) {
-      console.warn('Language switch restart caught:', e);
+/**
+ * Transitions recognition to a new language smoothly
+ */
+function switchRecognitionLanguage(newLangCode, isUserOverride = false) {
+  if (currentLangCode === newLangCode && !isUserOverride) return;
+
+  currentLangCode = newLangCode;
+  const langObj = Object.values(LANG_CONFIG).find(l => l.code === newLangCode) || LANG_CONFIG.MALAYALAM;
+  updateLanguageUI(langObj);
+
+  if (recognition) {
+    recognition.lang = newLangCode;
+
+    // If currently recording, safely restart to rebind acoustic model
+    if (appState === 'recording' && !isRestarting) {
+      isRestarting = true;
+      try {
+        recognition.stop();
+      } catch (e) {
+        isRestarting = false;
+      }
     }
   }
 }
 
 // -------------------------------------------------------------
-// 3. Web Speech API Lifecycle & Continuous Transcription
+// 3. Web Speech API Lifecycle & Engine Management
 // -------------------------------------------------------------
 
 function initSpeechRecognition() {
@@ -220,6 +222,9 @@ function initSpeechRecognition() {
     return null;
   }
 
+  // Ensure unsupported banner is hidden on supported browsers
+  if (unsupportedAlert) unsupportedAlert.classList.add('hidden');
+
   const rec = new SpeechRecognition();
   rec.continuous = true;
   rec.interimResults = true;
@@ -227,6 +232,7 @@ function initSpeechRecognition() {
   rec.lang = currentLangCode;
 
   rec.onstart = () => {
+    isRestarting = false;
     appState = 'recording';
     updateControls();
     updateStatus('listening');
@@ -240,13 +246,15 @@ function initSpeechRecognition() {
       const piece = event.results[i][0].transcript;
 
       if (event.results[i].isFinal) {
-        // Evaluate the finalized speech chunk for automatic language detection
-        const detected = evaluateSpokenLanguage(piece);
-        if (detected && detected.code !== currentLangCode) {
-          setDetectedLanguage(detected);
+        // Automatic language evaluation in Auto mode
+        if (activeMode === 'auto') {
+          const detected = evaluateSpokenLanguage(piece);
+          if (detected && detected.code !== currentLangCode) {
+            switchRecognitionLanguage(detected.code);
+          }
         }
 
-        // Append finalized text with proper spacing
+        // Append finalized text seamlessly
         if (finalTranscript.length > 0 && !finalTranscript.endsWith(' ') && !finalTranscript.endsWith('\n')) {
           finalTranscript += ' ';
         }
@@ -256,7 +264,6 @@ function initSpeechRecognition() {
 
         // Auto-scroll textarea to bottom
         textEditor.scrollTop = textEditor.scrollHeight;
-        consecutiveSilenceCount = 0;
       } else {
         currentInterim += piece;
       }
@@ -264,12 +271,13 @@ function initSpeechRecognition() {
 
     interimTranscript = currentInterim;
 
-    // Evaluate in-flight interim speech for quick language anticipation
+    // Display provisional / interim text separately to avoid text duplication
     if (interimTranscript.trim().length > 0) {
-      const interimDetected = evaluateSpokenLanguage(interimTranscript);
-      if (interimDetected && interimDetected.code !== currentLangCode) {
-        // Update status badge proactively
-        detectedLangName.textContent = interimDetected.name;
+      if (activeMode === 'auto') {
+        const interimDetected = evaluateSpokenLanguage(interimTranscript);
+        if (interimDetected && interimDetected.code !== currentLangCode) {
+          detectedLangName.textContent = interimDetected.name;
+        }
       }
 
       interimStream.classList.remove('hidden');
@@ -281,36 +289,45 @@ function initSpeechRecognition() {
   };
 
   rec.onerror = (event) => {
-    console.warn('Speech recognition event error:', event.error);
+    console.warn('Speech recognition notice:', event.error);
 
     if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-      showToast('Microphone access denied. Please allow microphone permission.', 'error');
+      showToast('Microphone access blocked. Please allow microphone permission in your browser.', 'error');
+      stopSession();
+      return;
+    }
+
+    if (event.error === 'audio-capture') {
+      showToast('No microphone found. Please connect or select an active microphone.', 'error');
       stopSession();
       return;
     }
 
     if (event.error === 'no-speech') {
-      // If user is speaking (audio energy detected) but current language produced no-speech,
-      // probe alternate candidate models (e.g. Malayalam -> Arabic probe)
-      consecutiveSilenceCount++;
-      if (consecutiveSilenceCount >= 2 && audioEnergy > 10) {
-        consecutiveSilenceCount = 0;
-        probeNextLanguageModel();
-      }
-    } else if (event.error === 'network') {
-      showToast('Network issue with speech recognition engine.', 'warning');
+      // Normal pause in speech: do nothing, maintain session
+      return;
+    }
+
+    if (event.error === 'network') {
+      showToast('Network issue with speech recognition service.', 'warning');
     }
   };
 
   rec.onend = () => {
-    // If not intentionally stopped or paused, automatically restart to maintain session
+    isRestarting = false;
+
+    // If still in recording mode and not paused or stopped, restart with debounce
     if (appState === 'recording' && !isIntentionalStop) {
-      try {
-        rec.lang = currentLangCode;
-        rec.start();
-      } catch (err) {
-        console.warn('Auto-restart notice:', err);
-      }
+      setTimeout(() => {
+        if (appState === 'recording') {
+          try {
+            rec.lang = currentLangCode;
+            rec.start();
+          } catch (err) {
+            console.warn('Recognition restart notice:', err);
+          }
+        }
+      }, 150);
     } else if (appState === 'paused') {
       updateStatus('paused');
       updateControls();
@@ -327,22 +344,6 @@ function initSpeechRecognition() {
   return rec;
 }
 
-/**
- * Intelligent acoustic probe when audio energy is present but active model produced silence
- */
-function probeNextLanguageModel() {
-  if (currentLangCode === LANG_CONFIG.MALAYALAM.code) {
-    // Try Arabic candidate
-    setDetectedLanguage(LANG_CONFIG.ARABIC, 'probe');
-  } else if (currentLangCode === LANG_CONFIG.ARABIC.code) {
-    // Revert to primary Malayalam
-    setDetectedLanguage(LANG_CONFIG.MALAYALAM, 'fallback');
-  } else {
-    // Revert to primary Malayalam
-    setDetectedLanguage(LANG_CONFIG.MALAYALAM, 'fallback');
-  }
-}
-
 function hideInterim() {
   interimTranscript = '';
   interimStream.classList.add('hidden');
@@ -350,69 +351,27 @@ function hideInterim() {
 }
 
 // -------------------------------------------------------------
-// 4. Web Audio Activity Monitoring (Microphone Energy)
+// 4. Session Controls (Start, Pause, Resume, Stop)
 // -------------------------------------------------------------
 
-async function initAudioMonitoring() {
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    analyserNode = audioContext.createAnalyser();
-    analyserNode.fftSize = 64;
-
-    const source = audioContext.createMediaStreamSource(micStream);
-    source.connect(analyserNode);
-
-    const buffer = new Uint8Array(analyserNode.frequencyBinCount);
-    const monitor = () => {
-      if (appState === 'recording' && analyserNode) {
-        analyserNode.getByteFrequencyData(buffer);
-        let sum = 0;
-        for (let i = 0; i < buffer.length; i++) sum += buffer[i];
-        audioEnergy = sum / buffer.length;
-      }
-      requestAnimationFrame(monitor);
-    };
-    monitor();
-  } catch (err) {
-    console.warn('Web Audio monitor notice:', err);
-  }
-}
-
-function stopAudioMonitoring() {
-  if (micStream) {
-    micStream.getTracks().forEach(t => t.stop());
-    micStream = null;
-  }
-  if (audioContext && audioContext.state !== 'closed') {
-    audioContext.close();
-    audioContext = null;
-  }
-}
-
-// -------------------------------------------------------------
-// 5. Audio & Session Controls (Start, Pause, Resume, Stop)
-// -------------------------------------------------------------
-
-async function startSession() {
+function startSession() {
   if (!recognition) {
     recognition = initSpeechRecognition();
     if (!recognition) return;
   }
 
   isIntentionalStop = false;
+  isRestarting = false;
   consecutiveEnglishTokens = 0;
-  consecutiveSilenceCount = 0;
 
-  // Always begin with Malayalam as the default highest-priority language (Requirement #3)
-  setDetectedLanguage(LANG_CONFIG.MALAYALAM);
-  recognition.lang = LANG_CONFIG.MALAYALAM.code;
+  // Set default language model
+  recognition.lang = currentLangCode;
 
   try {
-    await initAudioMonitoring();
     recognition.start();
-    showToast('Listening in Auto-Detect mode (Malayalam/Arabic/English)...', 'info');
+    showToast(`Listening in ${detectedLang.name}...`, 'info');
   } catch (err) {
+    // If already active or starting, gracefully ignore
     console.warn('Recognition start caught:', err);
   }
 }
@@ -429,7 +388,6 @@ function pauseSession() {
     console.warn(err);
   }
 
-  stopAudioMonitoring();
   stopTimer();
   updateStatus('paused');
   updateControls();
@@ -444,7 +402,6 @@ function resumeSession() {
   recognition.lang = currentLangCode;
 
   try {
-    initAudioMonitoring();
     recognition.start();
     appState = 'recording';
     updateControls();
@@ -452,7 +409,7 @@ function resumeSession() {
     startTimer();
     showToast(`Resuming (${detectedLang.name})...`, 'info');
   } catch (err) {
-    console.warn('Resume error:', err);
+    console.warn('Resume notice:', err);
   }
 }
 
@@ -468,7 +425,6 @@ function stopSession() {
     console.warn(err);
   }
 
-  stopAudioMonitoring();
   stopTimer();
   updateStatus('stopped');
   updateControls();
@@ -477,7 +433,7 @@ function stopSession() {
 }
 
 // -------------------------------------------------------------
-// 6. Status Indicator & Button States
+// 5. Controls & Status Indicator Management
 // -------------------------------------------------------------
 
 function updateControls() {
@@ -492,7 +448,6 @@ function updateControls() {
     resumeBtn.disabled = false;
     stopBtn.disabled = false;
   } else {
-    // 'idle' or 'stopped'
     startBtn.disabled = false;
     pauseBtn.disabled = true;
     resumeBtn.disabled = true;
@@ -525,6 +480,30 @@ function updateStatus(status) {
     statusPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700';
   }
 }
+
+// -------------------------------------------------------------
+// 6. Language Chips Handler (Auto + One-Tap Fast Override)
+// -------------------------------------------------------------
+
+langChips.forEach(chip => {
+  chip.addEventListener('click', () => {
+    langChips.forEach(c => c.classList.remove('active-chip'));
+    chip.classList.add('active-chip');
+
+    const mode = chip.dataset.mode;
+    activeMode = mode;
+
+    if (mode === 'auto') {
+      // Revert to primary Malayalam as default
+      switchRecognitionLanguage(LANG_CONFIG.MALAYALAM.code, true);
+      showToast('Switched to Auto-Detect mode (Malayalam primary).', 'info');
+    } else {
+      switchRecognitionLanguage(mode, true);
+      const name = mode === 'ml-IN' ? 'Malayalam' : mode === 'ar-SA' ? 'Arabic' : 'English';
+      showToast(`Language set to ${name}.`, 'info');
+    }
+  });
+});
 
 // -------------------------------------------------------------
 // 7. Timer System (MM:SS)
@@ -580,10 +559,12 @@ function updateCounters() {
 textEditor.addEventListener('input', () => {
   finalTranscript = textEditor.value;
 
-  // If user typed content in a specific script, update indicator accordingly
-  const detected = evaluateSpokenLanguage(finalTranscript);
-  if (detected) {
-    setDetectedLanguage(detected);
+  // Auto-detect language script from typed text
+  if (activeMode === 'auto') {
+    const detected = evaluateSpokenLanguage(finalTranscript);
+    if (detected) {
+      updateLanguageUI(detected);
+    }
   }
 
   updateCounters();
@@ -658,7 +639,7 @@ clearBtn.addEventListener('click', () => {
     hideInterim();
     resetTimer();
     updateCounters();
-    setDetectedLanguage(LANG_CONFIG.MALAYALAM);
+    updateLanguageUI(LANG_CONFIG.MALAYALAM);
     showToast('Text editor cleared.', 'info');
   }
 });
@@ -761,8 +742,8 @@ window.addEventListener('DOMContentLoaded', () => {
   updateCounters();
 
   // Initialize language detection with Malayalam as default
-  setDetectedLanguage(LANG_CONFIG.MALAYALAM);
+  updateLanguageUI(LANG_CONFIG.MALAYALAM);
 
-  // Pre-initialize speech recognition
+  // Initialize speech recognition
   recognition = initSpeechRecognition();
 });

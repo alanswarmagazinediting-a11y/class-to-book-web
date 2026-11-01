@@ -98,8 +98,8 @@
       <!-- Top Row: Language Dropdown + Recording Indicator + Status Badge + Timer -->
       <div class="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100 dark:border-slate-800/60">
         
-        <!-- Automatic Language Detection Status Indicator -->
-        <div class="flex items-center gap-2.5">
+        <!-- Automatic Language Detection Status Indicator & Mode Chips -->
+        <div class="flex flex-wrap items-center gap-2.5">
           <div id="detectedLangPill" class="flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-800 dark:text-emerald-300 shadow-sm transition-all">
             <span id="detectedLangDot" class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
             <span class="text-slate-500 dark:text-slate-400 font-normal">Detected:</span>
@@ -107,10 +107,21 @@
             <span id="detectedLangBadge" class="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300 ml-0.5">Primary</span>
           </div>
 
-          <span class="hidden sm:inline-flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-slate-500 font-medium">
-            <i data-lucide="sparkles" class="w-3.5 h-3.5 text-indigo-400"></i>
-            <span>Auto: മലയാളം • العربية • English</span>
-          </span>
+          <!-- Seamless Multi-Language Chips (Zero Dropdown) -->
+          <div class="flex items-center bg-slate-100 dark:bg-slate-800 p-0.5 rounded-xl text-xs font-medium border border-slate-200 dark:border-slate-700">
+            <button id="chipAuto" class="lang-chip active-chip px-2.5 py-1 rounded-lg transition-all" data-mode="auto">
+              ⚡ Auto
+            </button>
+            <button id="chipMl" class="lang-chip px-2.5 py-1 rounded-lg transition-all text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white" data-mode="ml-IN">
+              മലയാളം
+            </button>
+            <button id="chipAr" class="lang-chip px-2.5 py-1 rounded-lg transition-all text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white" data-mode="ar-SA">
+              العربية
+            </button>
+            <button id="chipEn" class="lang-chip px-2.5 py-1 rounded-lg transition-all text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white" data-mode="en-US">
+              English
+            </button>
+          </div>
         </div>
 
         <!-- Status & Timer Cluster -->

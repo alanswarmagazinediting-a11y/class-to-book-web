@@ -58,6 +58,33 @@ textarea::-webkit-scrollbar-thumb:hover {
   line-height: 1.9;
 }
 
+/* Language Switch Chips */
+.lang-chip {
+  color: #64748b;
+  font-size: 11px;
+  cursor: pointer;
+}
+.lang-chip:hover {
+  color: #0f172a;
+}
+.dark .lang-chip {
+  color: #94a3b8;
+}
+.dark .lang-chip:hover {
+  color: #f8fafc;
+}
+.lang-chip.active-chip {
+  background-color: #ffffff;
+  color: #4f46e5 !important;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+.dark .lang-chip.active-chip {
+  background-color: #0f172a;
+  color: #818cf8 !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+
 /* Toast Transitions */
 #toast.show {
   transform: translateY(0);
