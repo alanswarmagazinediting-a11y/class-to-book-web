@@ -2,15 +2,13 @@
  * VoiceType – Live Speech to Text
  * Pure Vanilla JavaScript implementation of Web Speech API
  * 
- * Zero-Duplication Architecture:
- * - Separates persisted transcript (from previous sessions/manual edits) from
- *   the current recognition session's results.
- * - In onresult, reconstructs sessionFinal from event.results directly.
- *   This ensures each finalized phrase is counted exactly once, completely
- *   eliminating cumulative word duplication ("Hello Hello Hello Hello").
- * - In-flight interim speech is rendered dynamically without permanent commitment.
+ * APPEND-ONLY Architecture (Zero Duplication):
+ * - Uses event.resultIndex to process ONLY new results.
+ * - finalTranscript is append-only: new final pieces are added, never reconstructed.
+ * - interimTranscript is rebuilt each event (ephemeral, never committed).
+ * - On pause/resume/restart, finalTranscript syncs FROM the textarea
+ *   so manual edits and previous text are always preserved.
  * - Supports Malayalam (ml-IN, Primary), Arabic (ar-SA, Secondary), and English (en-US, Tertiary).
- * - Full session continuity across Pause, Resume, Stop, and Auto-Restart.
  */
 
 // Supported Languages Configuration
@@ -34,15 +32,23 @@ let activeMode = 'auto'; // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
 let currentLangCode = 'ml-IN'; // Default Malayalam (Primary)
 let detectedLang = LANG_CONFIG.MALAYALAM;
 
-// Transcript Memory Model (Guarantees ZERO duplicate words)
-let persistedTranscript = ''; // Text from previous sessions or manual typing
-let sessionFinal = '';        // Finalized text in the CURRENT active recognition session
-let sessionInterim = '';      // Provisional unfinalized speech in CURRENT active session
+// ============================================================
+// APPEND-ONLY Transcript Model (Guarantees ZERO duplicate words)
+// ============================================================
+// finalTranscript: accumulates all finalized speech. Grows only via +=.
+//                  Never rebuilt from event.results. Synced from textarea
+//                  before every start/resume so manual edits are kept.
+// (interimTranscript is local to each onresult call — never stored.)
+// ============================================================
+let finalTranscript = '';
 
 let isIntentionalStop = false;
 let isRestarting = false;
 let resultCount = 0;
 let consecutiveEnglishTokens = 0;
+
+// Pending language switch (deferred until AFTER onresult finishes)
+let pendingLangSwitch = null;
 
 // Timer State
 let timerInterval = null;
@@ -191,13 +197,9 @@ function evaluateSpokenLanguage(phrase) {
     return LANG_CONFIG.MALAYALAM;
   }
 
-  // 3. English Hysteresis Check:
-  // Malayalam speakers frequently use single English loanwords (e.g., "school", "bus", "time", "class").
-  // Do NOT switch if there is only 1 or 2 isolated English words while in Malayalam mode.
+  // 3. English Hysteresis Check
   if (englishMatches.length > 0) {
     consecutiveEnglishTokens += englishMatches.length;
-
-    // Switch only after 3+ consecutive English words without Malayalam
     if (consecutiveEnglishTokens >= 3) {
       return LANG_CONFIG.ENGLISH;
     }
@@ -232,22 +234,20 @@ function updateLanguageUI(langObj) {
   }
 }
 
-function commitSessionText() {
-  if (sessionFinal.trim()) {
-    if (persistedTranscript && !persistedTranscript.endsWith(' ') && !persistedTranscript.endsWith('\n')) {
-      persistedTranscript += ' ';
-    }
-    persistedTranscript += sessionFinal.trim();
-  }
-  sessionFinal = '';
-  sessionInterim = '';
+/**
+ * Schedule a language switch to happen AFTER onresult finishes.
+ * This prevents commitSessionText() from running mid-handler,
+ * which was the primary source of word duplication.
+ */
+function requestLanguageSwitch(newCode) {
+  if (currentLangCode === newCode) return;
+  pendingLangSwitch = newCode;
 }
 
-function switchLanguage(newCode, isUserClick = false) {
-  if (currentLangCode === newCode && !isUserClick) return;
-
-  // Commit current session text before language change
-  commitSessionText();
+function applyPendingLanguageSwitch() {
+  if (!pendingLangSwitch) return;
+  const newCode = pendingLangSwitch;
+  pendingLangSwitch = null;
 
   currentLangCode = newCode;
   const langObj = Object.values(LANG_CONFIG).find(l => l.code === newCode) || LANG_CONFIG.MALAYALAM;
@@ -258,9 +258,37 @@ function switchLanguage(newCode, isUserClick = false) {
 
     // If currently recording, safely restart with the new language model
     if (appState === 'recording' && !isRestarting) {
+      // Do NOT re-read the textarea here: finalTranscript already holds the
+      // finalized text. Reading it would promote provisional interim text and
+      // risk duplicating it once the engine restarts in the new language.
       isRestarting = true;
       try {
-        recognition.stop();
+        recognition.stop(); // will trigger onend → auto-restart
+      } catch (e) {
+        isRestarting = false;
+      }
+    }
+  }
+}
+
+function switchLanguage(newCode, isUserClick = false) {
+  if (currentLangCode === newCode && !isUserClick) return;
+
+  currentLangCode = newCode;
+  const langObj = Object.values(LANG_CONFIG).find(l => l.code === newCode) || LANG_CONFIG.MALAYALAM;
+  updateLanguageUI(langObj);
+
+  if (recognition) {
+    recognition.lang = newCode;
+
+    // If currently recording, safely restart with the new language model
+    if (appState === 'recording' && !isRestarting) {
+      // Do NOT re-read the textarea here: finalTranscript already holds the
+      // finalized text. Reading it would promote provisional interim text and
+      // risk duplicating it once the engine restarts.
+      isRestarting = true;
+      try {
+        recognition.stop(); // triggers onend → auto-restart
       } catch (e) {
         isRestarting = false;
       }
@@ -348,69 +376,57 @@ function initSpeechRecognition() {
   };
 
   // -----------------------------------------------------------
-  // ZERO-DUPLICATION SPEECH EVENT HANDLER (CRITICAL LOGIC)
+  // APPEND-ONLY SPEECH EVENT HANDLER (ZERO DUPLICATION)
+  // -----------------------------------------------------------
+  // KEY RULES:
+  //   1. Loop starts at event.resultIndex — skip already-processed results.
+  //   2. finalTranscript grows via += only — never rebuilt from scratch.
+  //   3. interimTranscript is local and ephemeral — rebuilt each event.
+  //   4. No commitSessionText(), no persistedTranscript, no reconstruction.
   // -----------------------------------------------------------
   rec.onresult = (event) => {
-    let currentFinal = '';
     let currentInterim = '';
 
-    // Reconstruct this session's speech directly from event.results
-    // This guarantees that each finalized phrase is counted exactly ONCE
-    for (let i = 0; i < event.results.length; ++i) {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
       const result = event.results[i];
-      const transcriptPiece = result[0].transcript;
+      const piece = result[0].transcript;
 
       if (result.isFinal) {
-        currentFinal += transcriptPiece.trim() + ' ';
+        // Append this new final piece — it has never been seen before
+        finalTranscript += piece;
 
-        // Check for automatic language detection on final results
+        // Auto language detection on the newly finalized text
         if (activeMode === 'auto') {
-          const detected = evaluateSpokenLanguage(transcriptPiece);
+          const detected = evaluateSpokenLanguage(piece);
           if (detected && detected.code !== currentLangCode) {
-            switchLanguage(detected.code);
+            // DEFER the switch — do NOT call switchLanguage() mid-handler
+            requestLanguageSwitch(detected.code);
           }
         }
       } else {
-        currentInterim += transcriptPiece;
+        currentInterim += piece;
       }
     }
 
-    sessionFinal = currentFinal;
-    sessionInterim = currentInterim;
     resultCount = event.results.length;
 
-    // Combine:
-    // 1. Text from previous sessions or manual typing (persistedTranscript)
-    // 2. Finalized speech in this active session (sessionFinal)
-    // 3. Provisional in-flight speech (sessionInterim)
-    let fullFinalized = persistedTranscript;
-    if (sessionFinal.trim()) {
-      if (fullFinalized && !fullFinalized.endsWith(' ') && !fullFinalized.endsWith('\n')) {
-        fullFinalized += ' ';
-      }
-      fullFinalized += sessionFinal.trim();
-    }
-
-    let liveDisplay = fullFinalized;
-    if (sessionInterim.trim()) {
-      if (liveDisplay && !liveDisplay.endsWith(' ') && !liveDisplay.endsWith('\n')) {
-        liveDisplay += ' ';
-      }
-      liveDisplay += sessionInterim.trim();
-    }
-
-    // Render directly into textarea without cumulative duplication
-    textEditor.value = liveDisplay;
+    // Render: all finalized text + live interim preview
+    textEditor.value = finalTranscript + currentInterim;
     updateCounters();
 
-    // Auto-scroll textarea to bottom so user always sees live speech
+    // Auto-scroll textarea to bottom
     textEditor.scrollTop = textEditor.scrollHeight;
 
-    // Update Live Diagnostic Panel
+    // Update Diagnostic Panel
     if (dbgResult) {
-      const snippet = (sessionInterim || sessionFinal || persistedTranscript).slice(-35);
+      const snippet = (currentInterim || finalTranscript).slice(-35);
       dbgResult.textContent = `Count: ${resultCount} | "${snippet}"`;
       dbgResult.className = 'font-semibold text-emerald-400 text-xs mt-0.5 truncate';
+    }
+
+    // Apply deferred language switch AFTER all result processing is done
+    if (pendingLangSwitch) {
+      applyPendingLanguageSwitch();
     }
   };
 
@@ -450,9 +466,16 @@ function initSpeechRecognition() {
   rec.onend = () => {
     isRestarting = false;
 
-    // Commit this session's finalized text cleanly before restarting or finishing
-    commitSessionText();
-    textEditor.value = persistedTranscript;
+    if (isIntentionalStop) {
+      // Explicit Pause / Stop: preserve exactly what the user currently sees
+      // (last finalized text plus the final interim preview) and any manual edits.
+      finalTranscript = textEditor.value;
+    } else {
+      // Spontaneous end (silence) or language-switch restart: drop the ephemeral
+      // interim preview and keep ONLY the finalized text. This guarantees that
+      // nothing can be committed twice when the engine auto-restarts.
+      textEditor.value = finalTranscript;
+    }
     updateCounters();
 
     if (dbgStarted) {
@@ -468,7 +491,7 @@ function initSpeechRecognition() {
       dbgSpeech.className = 'font-bold text-slate-400 text-xs mt-0.5';
     }
 
-    // If still in recording mode and not intentionally stopped/paused, restart with safe debounce
+    // Auto-restart if still in recording mode and not intentionally stopped
     if (appState === 'recording' && !isIntentionalStop) {
       setTimeout(() => {
         if (appState === 'recording') {
@@ -507,10 +530,8 @@ function startSession() {
   isIntentionalStop = false;
   isRestarting = false;
 
-  // Synchronize memory model with current textarea text before starting
-  persistedTranscript = textEditor.value;
-  sessionFinal = '';
-  sessionInterim = '';
+  // Sync finalTranscript from current textarea content (preserves manual edits)
+  finalTranscript = textEditor.value;
 
   // Set language
   recognition.lang = currentLangCode;
@@ -540,8 +561,9 @@ function pauseSession() {
     console.warn(err);
   }
 
-  commitSessionText();
-  textEditor.value = persistedTranscript;
+  // Sync finalTranscript from textarea (captures everything including interim
+  // that was being shown — user sees it, so it becomes the persisted state)
+  finalTranscript = textEditor.value;
   updateCounters();
 
   stopTimer();
@@ -554,9 +576,18 @@ function resumeSession() {
   if (appState !== 'paused') return;
 
   isIntentionalStop = false;
-  persistedTranscript = textEditor.value;
-  sessionFinal = '';
-  sessionInterim = '';
+
+  // Sync finalTranscript from textarea (user may have edited text while paused)
+  finalTranscript = textEditor.value;
+
+  // Add a trailing space if needed so new speech doesn't merge with last word
+  if (finalTranscript.length > 0 &&
+      !finalTranscript.endsWith(' ') &&
+      !finalTranscript.endsWith('\n')) {
+    finalTranscript += ' ';
+    textEditor.value = finalTranscript;
+  }
+
   recognition.lang = currentLangCode;
 
   try {
@@ -583,8 +614,7 @@ function stopSession() {
     console.warn(err);
   }
 
-  commitSessionText();
-  textEditor.value = persistedTranscript;
+  finalTranscript = textEditor.value;
   updateCounters();
 
   stopTimer();
@@ -713,11 +743,9 @@ function updateCounters() {
   totalCharsNoSpaceEl.textContent = noSpaces.toLocaleString();
 }
 
-// Synchronize manual typing in textarea with memory model
+// Synchronize manual typing in textarea with finalTranscript
 textEditor.addEventListener('input', () => {
-  persistedTranscript = textEditor.value;
-  sessionFinal = '';
-  sessionInterim = '';
+  finalTranscript = textEditor.value;
   updateCounters();
 });
 
@@ -786,9 +814,7 @@ clearBtn.addEventListener('click', () => {
 
   if (confirm('Are you sure you want to clear the entire text editor?')) {
     textEditor.value = '';
-    persistedTranscript = '';
-    sessionFinal = '';
-    sessionInterim = '';
+    finalTranscript = '';
     resultCount = 0;
     resetTimer();
     updateCounters();
