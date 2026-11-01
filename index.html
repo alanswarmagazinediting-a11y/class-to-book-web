@@ -272,6 +272,55 @@
       </div>
     </div>
 
+    <!-- Real-Time Diagnostic Debugging Panel (Requested by User) -->
+    <div id="debugPanel" class="bg-slate-900 text-slate-200 rounded-2xl p-4 sm:p-5 border border-slate-800 shadow-md flex flex-col gap-3 font-mono text-xs">
+      <div class="flex items-center justify-between pb-2 border-b border-slate-800">
+        <span class="flex items-center gap-2 font-bold text-slate-100 text-sm">
+          <i data-lucide="activity" class="w-4 h-4 text-emerald-400"></i>
+          <span>Speech Engine Diagnostic Panel</span>
+        </span>
+        <span class="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-400">Live Debugger</span>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5 pt-1">
+        <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
+          <div class="text-slate-400 text-[10px] uppercase">Recognition Supported</div>
+          <div id="dbgSupported" class="font-bold text-emerald-400 text-xs mt-0.5">Checking...</div>
+        </div>
+        <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
+          <div class="text-slate-400 text-[10px] uppercase">Microphone Permission</div>
+          <div id="dbgMicPerm" class="font-bold text-slate-200 text-xs mt-0.5">Checking...</div>
+        </div>
+        <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
+          <div class="text-slate-400 text-[10px] uppercase">Recognition Started (onstart)</div>
+          <div id="dbgStarted" class="font-bold text-slate-400 text-xs mt-0.5">No</div>
+        </div>
+        <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
+          <div class="text-slate-400 text-[10px] uppercase">Audio Captured (onaudiostart)</div>
+          <div id="dbgAudio" class="font-bold text-slate-400 text-xs mt-0.5">No</div>
+        </div>
+        <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
+          <div class="text-slate-400 text-[10px] uppercase">Speech Detected (onspeechstart)</div>
+          <div id="dbgSpeech" class="font-bold text-slate-400 text-xs mt-0.5">No</div>
+        </div>
+        <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
+          <div class="text-slate-400 text-[10px] uppercase">Active Engine Language</div>
+          <div id="dbgLang" class="font-bold text-indigo-400 text-xs mt-0.5">ml-IN (Malayalam)</div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+        <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
+          <div class="text-slate-400 text-[10px] uppercase">Recognition Result Received (onresult)</div>
+          <div id="dbgResult" class="font-semibold text-emerald-400 text-xs mt-0.5 truncate">0 results received</div>
+        </div>
+        <div class="p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80">
+          <div class="text-slate-400 text-[10px] uppercase">Last Error / Notice (onerror)</div>
+          <div id="dbgError" class="font-semibold text-slate-400 text-xs mt-0.5 truncate">None</div>
+        </div>
+      </div>
+    </div>
+
     <!-- Privacy Notice -->
     <div class="p-4 rounded-xl bg-indigo-50/70 dark:bg-indigo-950/30 border border-indigo-100 dark:border-indigo-900/50 flex items-start gap-3 text-xs text-indigo-900 dark:text-indigo-200">
       <i data-lucide="shield-check" class="w-5 h-5 text-indigo-600 dark:text-indigo-400 flex-shrink-0 mt-0.5"></i>

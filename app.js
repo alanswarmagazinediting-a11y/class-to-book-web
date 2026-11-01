@@ -3,17 +3,18 @@
  * Pure Vanilla JavaScript implementation of Web Speech API
  * 
  * Features:
- * - Direct, rock-solid SpeechRecognition lifecycle (ZERO hardware mic conflicts)
- * - Intelligent Multilingual Auto-Detection (Malayalam [Primary], Arabic, English)
- * - Loanword Hysteresis Filter (Preserves Malayalam on single English loanwords)
- * - Original Script Preservation (Malayalam, Arabic, English)
+ * - Direct, rock-solid SpeechRecognition lifecycle with zero hardware conflicts
+ * - Live Diagnostic Debugging Panel (mic permission, audio capture, speech detection, onresult, onerror)
+ * - Immediate text insertion in textarea (interim + final)
+ * - Fixed primary language: Malayalam (ml-IN)
+ * - Multi-language support: Malayalam, Arabic (ar-SA), English (en-US)
  * - Start, Pause, Resume, Stop controls with session continuity
  * - Word & Character Counters (Words, Chars, Chars excluding spaces)
  * - Copy Text, Download TXT, Clear Text, Select All
  * - MM:SS Timer, Light/Dark Mode, and Keyboard Shortcuts
  */
 
-// Supported Languages & Priority Configuration
+// Supported Languages Configuration
 const LANG_CONFIG = {
   MALAYALAM: { code: 'ml-IN', name: 'Malayalam', badge: 'Primary', script: 'മലയാളം' },
   ARABIC:    { code: 'ar-SA', name: 'Arabic',    badge: 'Secondary', script: 'العربية' },
@@ -30,15 +31,15 @@ const SCRIPT_PATTERNS = {
 // Application State
 let recognition = null;
 let appState = 'idle'; // 'idle' | 'recording' | 'paused' | 'stopped'
-let activeMode = 'auto'; // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
-let currentLangCode = LANG_CONFIG.MALAYALAM.code; // Default = Malayalam
+let activeMode = 'ml-IN'; // Fixed Malayalam by default as requested in debugging step
+let currentLangCode = 'ml-IN'; // Fixed Malayalam
 let detectedLang = LANG_CONFIG.MALAYALAM;
 
 let finalTranscript = '';
 let interimTranscript = '';
 let isIntentionalStop = false;
-let consecutiveEnglishTokens = 0;
 let isRestarting = false;
+let resultCount = 0;
 
 // Timer State
 let timerInterval = null;
@@ -83,6 +84,16 @@ const toastMsg = document.getElementById('toastMsg');
 const toastIcon = document.getElementById('toastIcon');
 const unsupportedAlert = document.getElementById('unsupportedAlert');
 
+// Diagnostic Debugging Elements
+const dbgSupported = document.getElementById('dbgSupported');
+const dbgMicPerm = document.getElementById('dbgMicPerm');
+const dbgStarted = document.getElementById('dbgStarted');
+const dbgAudio = document.getElementById('dbgAudio');
+const dbgSpeech = document.getElementById('dbgSpeech');
+const dbgLang = document.getElementById('dbgLang');
+const dbgResult = document.getElementById('dbgResult');
+const dbgError = document.getElementById('dbgError');
+
 // -------------------------------------------------------------
 // 1. Toast Notification System
 // -------------------------------------------------------------
@@ -113,98 +124,40 @@ function showToast(message, type = 'success') {
   toast.classList.add('show');
   toastTimeout = setTimeout(() => {
     toast.classList.remove('show');
-  }, 2800);
+  }, 3000);
 }
 
 // -------------------------------------------------------------
-// 2. Language Detection & Hysteresis Controller
+// 2. Microphone Permissions & Support Verification
 // -------------------------------------------------------------
 
-/**
- * Evaluates spoken phrase for Malayalam, Arabic, or English
- * Applies hysteresis to ignore 1-2 isolated English loanwords in Malayalam
- */
-function evaluateSpokenLanguage(phrase) {
-  if (!phrase || phrase.trim().length === 0) return null;
-
-  const hasMalayalam = SCRIPT_PATTERNS.malayalam.test(phrase);
-  const hasArabic = SCRIPT_PATTERNS.arabic.test(phrase);
-  const englishMatches = phrase.match(/[a-zA-Z]+/g) || [];
-
-  // 1. Arabic: High confidence on Arabic script
-  if (hasArabic) {
-    consecutiveEnglishTokens = 0;
-    return LANG_CONFIG.ARABIC;
-  }
-
-  // 2. Malayalam: Highest priority
-  if (hasMalayalam) {
-    consecutiveEnglishTokens = 0;
-    return LANG_CONFIG.MALAYALAM;
-  }
-
-  // 3. English Hysteresis Check:
-  // Malayalam speakers frequently use single English loanwords (e.g., "school", "bus", "time", "class").
-  // Do NOT switch if there is only 1 or 2 isolated English words while in Malayalam mode.
-  if (englishMatches.length > 0) {
-    consecutiveEnglishTokens += englishMatches.length;
-
-    // Switch only after 3+ consecutive English words without Malayalam
-    if (consecutiveEnglishTokens >= 3) {
-      return LANG_CONFIG.ENGLISH;
+async function checkMicrophonePermission() {
+  if (navigator.permissions && navigator.permissions.query) {
+    try {
+      const permissionStatus = await navigator.permissions.query({ name: 'microphone' });
+      updateMicPermissionUI(permissionStatus.state);
+      permissionStatus.onchange = () => {
+        updateMicPermissionUI(permissionStatus.state);
+      };
+    } catch (err) {
+      updateMicPermissionUI('Supported (Prompt on Start)');
     }
   } else {
-    consecutiveEnglishTokens = 0;
-  }
-
-  return null;
-}
-
-/**
- * Updates UI badge for detected language
- */
-function updateLanguageUI(langObj) {
-  detectedLang = langObj;
-  detectedLangName.textContent = langObj.name;
-  detectedLangBadge.textContent = langObj.badge;
-
-  if (langObj.code === LANG_CONFIG.MALAYALAM.code) {
-    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-800 dark:text-emerald-300 shadow-sm transition-all';
-    detectedLangDot.className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
-    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300 ml-0.5';
-  } else if (langObj.code === LANG_CONFIG.ARABIC.code) {
-    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-300 shadow-sm transition-all';
-    detectedLangDot.className = 'w-2 h-2 rounded-full bg-amber-500 animate-pulse';
-    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300 ml-0.5';
-  } else {
-    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800/60 text-sky-800 dark:text-sky-300 shadow-sm transition-all';
-    detectedLangDot.className = 'w-2 h-2 rounded-full bg-sky-500 animate-pulse';
-    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-sky-100 dark:bg-sky-900/60 text-sky-700 dark:text-sky-300 ml-0.5';
+    updateMicPermissionUI('Supported (Browser default)');
   }
 }
 
-/**
- * Transitions recognition to a new language smoothly
- */
-function switchRecognitionLanguage(newLangCode, isUserOverride = false) {
-  if (currentLangCode === newLangCode && !isUserOverride) return;
-
-  currentLangCode = newLangCode;
-  const langObj = Object.values(LANG_CONFIG).find(l => l.code === newLangCode) || LANG_CONFIG.MALAYALAM;
-  updateLanguageUI(langObj);
-
-  if (recognition) {
-    recognition.lang = newLangCode;
-
-    // If currently recording, safely restart to rebind acoustic model
-    if (appState === 'recording' && !isRestarting) {
-      isRestarting = true;
-      try {
-        recognition.stop();
-      } catch (e) {
-        isRestarting = false;
-      }
-    }
+function updateMicPermissionUI(state) {
+  if (!dbgMicPerm) return;
+  if (state === 'granted') {
+    dbgMicPerm.textContent = 'Granted (Ready)';
+    dbgMicPerm.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+  } else if (state === 'denied') {
+    dbgMicPerm.textContent = 'Blocked / Denied';
+    dbgMicPerm.className = 'font-bold text-rose-400 text-xs mt-0.5';
+  } else {
+    dbgMicPerm.textContent = 'Prompt (Click Start)';
+    dbgMicPerm.className = 'font-bold text-amber-400 text-xs mt-0.5';
   }
 }
 
@@ -217,13 +170,20 @@ function initSpeechRecognition() {
 
   if (!SpeechRecognition) {
     if (unsupportedAlert) unsupportedAlert.classList.remove('hidden');
+    if (dbgSupported) {
+      dbgSupported.textContent = 'No (Unsupported Browser)';
+      dbgSupported.className = 'font-bold text-rose-400 text-xs mt-0.5';
+    }
     startBtn.disabled = true;
     updateStatus('unsupported');
     return null;
   }
 
-  // Ensure unsupported banner is hidden on supported browsers
   if (unsupportedAlert) unsupportedAlert.classList.add('hidden');
+  if (dbgSupported) {
+    dbgSupported.textContent = 'Yes (webkitSpeechRecognition)';
+    dbgSupported.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+  }
 
   const rec = new SpeechRecognition();
   rec.continuous = true;
@@ -231,14 +191,52 @@ function initSpeechRecognition() {
   rec.maxAlternatives = 1;
   rec.lang = currentLangCode;
 
+  // On Start
   rec.onstart = () => {
     isRestarting = false;
     appState = 'recording';
     updateControls();
     updateStatus('listening');
     startTimer();
+
+    if (dbgStarted) {
+      dbgStarted.textContent = 'Yes (Active)';
+      dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+    }
+    if (dbgAudio) {
+      dbgAudio.textContent = 'Connecting...';
+      dbgAudio.className = 'font-bold text-amber-400 text-xs mt-0.5';
+    }
+    if (dbgSpeech) {
+      dbgSpeech.textContent = 'Waiting for voice...';
+      dbgSpeech.className = 'font-bold text-slate-400 text-xs mt-0.5';
+    }
   };
 
+  // Audio Capture Started
+  rec.onaudiostart = () => {
+    if (dbgAudio) {
+      dbgAudio.textContent = 'Yes (Mic Streaming)';
+      dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+    }
+  };
+
+  // Sound/Speech Detected
+  rec.onsoundstart = () => {
+    if (dbgSpeech) {
+      dbgSpeech.textContent = 'Sound Detected';
+      dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+    }
+  };
+
+  rec.onspeechstart = () => {
+    if (dbgSpeech) {
+      dbgSpeech.textContent = 'Speech Detected';
+      dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+    }
+  };
+
+  // Speech Recognition Result Event (THE CORE ENGINE)
   rec.onresult = (event) => {
     let currentInterim = '';
 
@@ -246,24 +244,12 @@ function initSpeechRecognition() {
       const piece = event.results[i][0].transcript;
 
       if (event.results[i].isFinal) {
-        // Automatic language evaluation in Auto mode
-        if (activeMode === 'auto') {
-          const detected = evaluateSpokenLanguage(piece);
-          if (detected && detected.code !== currentLangCode) {
-            switchRecognitionLanguage(detected.code);
-          }
-        }
-
-        // Append finalized text seamlessly
+        // Append finalized text with proper spacing
         if (finalTranscript.length > 0 && !finalTranscript.endsWith(' ') && !finalTranscript.endsWith('\n')) {
           finalTranscript += ' ';
         }
         finalTranscript += piece.trim();
-        textEditor.value = finalTranscript;
-        updateCounters();
-
-        // Auto-scroll textarea to bottom
-        textEditor.scrollTop = textEditor.scrollHeight;
+        resultCount++;
       } else {
         currentInterim += piece;
       }
@@ -271,52 +257,73 @@ function initSpeechRecognition() {
 
     interimTranscript = currentInterim;
 
-    // Display provisional / interim text separately to avoid text duplication
-    if (interimTranscript.trim().length > 0) {
-      if (activeMode === 'auto') {
-        const interimDetected = evaluateSpokenLanguage(interimTranscript);
-        if (interimDetected && interimDetected.code !== currentLangCode) {
-          detectedLangName.textContent = interimDetected.name;
-        }
-      }
+    // IMMEDIATE INSERTION: Render live transcript directly inside textarea!
+    // Shows finalized text + live in-flight speech without duplicate words
+    const displayValue = finalTranscript + (currentInterim ? (finalTranscript ? ' ' : '') + currentInterim : '');
+    textEditor.value = displayValue;
+    updateCounters();
 
-      interimStream.classList.remove('hidden');
-      interimText.textContent = interimTranscript;
-    } else {
-      interimStream.classList.add('hidden');
-      interimText.textContent = '';
+    // Auto-scroll textarea to bottom so user always sees live speech
+    textEditor.scrollTop = textEditor.scrollHeight;
+
+    // Update Live Diagnostic Panel
+    if (dbgResult) {
+      const lastSnippet = (currentInterim || finalTranscript).slice(-35);
+      dbgResult.textContent = `Count: ${resultCount} | "${lastSnippet}"`;
+      dbgResult.className = 'font-semibold text-emerald-400 text-xs mt-0.5 truncate';
     }
   };
 
+  // Error Event
   rec.onerror = (event) => {
     console.warn('Speech recognition notice:', event.error);
 
+    if (dbgError) {
+      dbgError.textContent = `Error: ${event.error} (${new Date().toLocaleTimeString()})`;
+      dbgError.className = 'font-semibold text-rose-400 text-xs mt-0.5 truncate';
+    }
+
     if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-      showToast('Microphone access blocked. Please allow microphone permission in your browser.', 'error');
+      showToast('Microphone access blocked. Please click the lock icon in Chrome URL bar and allow microphone.', 'error');
       stopSession();
+      updateMicPermissionUI('denied');
       return;
     }
 
     if (event.error === 'audio-capture') {
-      showToast('No microphone found. Please connect or select an active microphone.', 'error');
+      showToast('No microphone found. Please connect or select a microphone.', 'error');
       stopSession();
       return;
     }
 
     if (event.error === 'no-speech') {
-      // Normal pause in speech: do nothing, maintain session
+      // Normal pause in speech: do not stop or restart!
       return;
     }
 
     if (event.error === 'network') {
-      showToast('Network issue with speech recognition service.', 'warning');
+      showToast('Network error: Unable to connect to Google Speech servers. Check internet connection.', 'error');
     }
   };
 
+  // End Event
   rec.onend = () => {
     isRestarting = false;
 
-    // If still in recording mode and not paused or stopped, restart with debounce
+    if (dbgStarted) {
+      dbgStarted.textContent = 'No (Ended)';
+      dbgStarted.className = 'font-bold text-slate-400 text-xs mt-0.5';
+    }
+    if (dbgAudio) {
+      dbgAudio.textContent = 'No';
+      dbgAudio.className = 'font-bold text-slate-400 text-xs mt-0.5';
+    }
+    if (dbgSpeech) {
+      dbgSpeech.textContent = 'No';
+      dbgSpeech.className = 'font-bold text-slate-400 text-xs mt-0.5';
+    }
+
+    // If still in recording mode and not paused or stopped, restart with safe debounce
     if (appState === 'recording' && !isIntentionalStop) {
       setTimeout(() => {
         if (appState === 'recording') {
@@ -324,7 +331,7 @@ function initSpeechRecognition() {
             rec.lang = currentLangCode;
             rec.start();
           } catch (err) {
-            console.warn('Recognition restart notice:', err);
+            console.warn('Auto-restart notice:', err);
           }
         }
       }, 150);
@@ -332,22 +339,14 @@ function initSpeechRecognition() {
       updateStatus('paused');
       updateControls();
       stopTimer();
-      hideInterim();
     } else {
       updateStatus('stopped');
       updateControls();
       stopTimer();
-      hideInterim();
     }
   };
 
   return rec;
-}
-
-function hideInterim() {
-  interimTranscript = '';
-  interimStream.classList.add('hidden');
-  interimText.textContent = '';
 }
 
 // -------------------------------------------------------------
@@ -362,16 +361,22 @@ function startSession() {
 
   isIntentionalStop = false;
   isRestarting = false;
-  consecutiveEnglishTokens = 0;
 
-  // Set default language model
+  // Sync finalTranscript with textarea content before starting
+  finalTranscript = textEditor.value;
+
+  // Set language
   recognition.lang = currentLangCode;
+
+  if (dbgError) {
+    dbgError.textContent = 'None';
+    dbgError.className = 'font-semibold text-slate-400 text-xs mt-0.5 truncate';
+  }
 
   try {
     recognition.start();
-    showToast(`Listening in ${detectedLang.name}...`, 'info');
+    showToast(`Microphone active. Listening in ${detectedLang.name}...`, 'info');
   } catch (err) {
-    // If already active or starting, gracefully ignore
     console.warn('Recognition start caught:', err);
   }
 }
@@ -391,7 +396,6 @@ function pauseSession() {
   stopTimer();
   updateStatus('paused');
   updateControls();
-  hideInterim();
   showToast('Recording paused. Text preserved.', 'info');
 }
 
@@ -399,6 +403,7 @@ function resumeSession() {
   if (appState !== 'paused') return;
 
   isIntentionalStop = false;
+  finalTranscript = textEditor.value;
   recognition.lang = currentLangCode;
 
   try {
@@ -428,7 +433,6 @@ function stopSession() {
   stopTimer();
   updateStatus('stopped');
   updateControls();
-  hideInterim();
   showToast('Recording session stopped.', 'info');
 }
 
@@ -482,8 +486,51 @@ function updateStatus(status) {
 }
 
 // -------------------------------------------------------------
-// 6. Language Chips Handler (Auto + One-Tap Fast Override)
+// 6. Language Selection & UI Management
 // -------------------------------------------------------------
+
+function updateLanguageUI(langObj) {
+  detectedLang = langObj;
+  detectedLangName.textContent = langObj.name;
+  detectedLangBadge.textContent = langObj.badge;
+
+  if (dbgLang) {
+    dbgLang.textContent = `${langObj.code} (${langObj.name})`;
+  }
+
+  if (langObj.code === LANG_CONFIG.MALAYALAM.code) {
+    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-800 dark:text-emerald-300 shadow-sm transition-all';
+    detectedLangDot.className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
+    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300 ml-0.5';
+  } else if (langObj.code === LANG_CONFIG.ARABIC.code) {
+    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-300 shadow-sm transition-all';
+    detectedLangDot.className = 'w-2 h-2 rounded-full bg-amber-500 animate-pulse';
+    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-700 dark:text-amber-300 ml-0.5';
+  } else {
+    detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800/60 text-sky-800 dark:text-sky-300 shadow-sm transition-all';
+    detectedLangDot.className = 'w-2 h-2 rounded-full bg-sky-500 animate-pulse';
+    detectedLangBadge.className = 'text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-sky-100 dark:bg-sky-900/60 text-sky-700 dark:text-sky-300 ml-0.5';
+  }
+}
+
+function switchLanguage(newCode) {
+  currentLangCode = newCode;
+  const langObj = Object.values(LANG_CONFIG).find(l => l.code === newCode) || LANG_CONFIG.MALAYALAM;
+  updateLanguageUI(langObj);
+
+  if (recognition) {
+    recognition.lang = newCode;
+
+    // If currently recording, safely restart with the new language
+    if (appState === 'recording') {
+      try {
+        recognition.stop();
+      } catch (e) {}
+    }
+  }
+
+  showToast(`Language set to ${langObj.name}`, 'info');
+}
 
 langChips.forEach(chip => {
   chip.addEventListener('click', () => {
@@ -493,14 +540,10 @@ langChips.forEach(chip => {
     const mode = chip.dataset.mode;
     activeMode = mode;
 
-    if (mode === 'auto') {
-      // Revert to primary Malayalam as default
-      switchRecognitionLanguage(LANG_CONFIG.MALAYALAM.code, true);
-      showToast('Switched to Auto-Detect mode (Malayalam primary).', 'info');
+    if (mode === 'auto' || mode === 'ml-IN') {
+      switchLanguage(LANG_CONFIG.MALAYALAM.code);
     } else {
-      switchRecognitionLanguage(mode, true);
-      const name = mode === 'ml-IN' ? 'Malayalam' : mode === 'ar-SA' ? 'Arabic' : 'English';
-      showToast(`Language set to ${name}.`, 'info');
+      switchLanguage(mode);
     }
   });
 });
@@ -558,15 +601,6 @@ function updateCounters() {
 // Synchronize manual typing in textarea with internal state
 textEditor.addEventListener('input', () => {
   finalTranscript = textEditor.value;
-
-  // Auto-detect language script from typed text
-  if (activeMode === 'auto') {
-    const detected = evaluateSpokenLanguage(finalTranscript);
-    if (detected) {
-      updateLanguageUI(detected);
-    }
-  }
-
   updateCounters();
 });
 
@@ -636,10 +670,11 @@ clearBtn.addEventListener('click', () => {
   if (confirm('Are you sure you want to clear the entire text editor?')) {
     textEditor.value = '';
     finalTranscript = '';
-    hideInterim();
+    interimTranscript = '';
+    resultCount = 0;
     resetTimer();
     updateCounters();
-    updateLanguageUI(LANG_CONFIG.MALAYALAM);
+    if (dbgResult) dbgResult.textContent = '0 results received';
     showToast('Text editor cleared.', 'info');
   }
 });
@@ -735,6 +770,9 @@ window.addEventListener('DOMContentLoaded', () => {
   // Load saved theme
   const savedTheme = localStorage.getItem('voicetype_theme') || 'light';
   applyTheme(savedTheme === 'dark');
+
+  // Verify microphone permissions
+  checkMicrophonePermission();
 
   // Initialize controls & counters
   updateControls();
