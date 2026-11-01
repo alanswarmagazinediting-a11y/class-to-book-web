@@ -1,70 +1,62 @@
-# 🎙️ VoiceType – Live Speech to Text
+# 🎙️ VoiceType – Live Speech to Text (Automatic Language Detection)
 
-A modern, professional, fully responsive web application that captures live microphone audio and converts spoken words into editable text in real time using the browser's native **Web Speech API** (`webkitSpeechRecognition` / `SpeechRecognition`).
+A modern, professional, fully responsive web application that captures live microphone audio and converts spoken words into editable text in real time with **Intelligent Automatic Language Detection** across **Malayalam**, **Arabic**, and **English**.
 
 ---
 
-## ✨ Key Features
+## ✨ Automatic Language Detection Architecture
 
-### 1. Speech Recognition Lifecycle
-- **▶ Start Button:** Requests microphone permission and begins live transcription.
-- **⏸ Pause Button:** Temporarily halts recognition while safely preserving all previously transcribed text.
-- **⏯ Resume Button:** Continues transcription right where you left off without any duplicated text.
-- **⏹ Stop Button:** Completely stops the current recording session.
-- **🔴 Pulsing Recording Indicator:** Subtle animated pulsing red dot indicating active listening.
-- **⚡ Zero Duplication Engine:** Finalized phrases and real-time interim speech are handled separately to guarantee text is never duplicated.
+The application removes manual language dropdowns and replaces them with an adaptive multi-language detection engine:
 
-### 2. Multi-Language Support
-- **English (US)** (`en-US`) – *Default*
-- **English (UK)** (`en-GB`)
-- **Malayalam (India)** (`ml-IN`) – Complex ligatures and conjunct support
-- **Arabic (Saudi Arabia)** (`ar-SA`) – Automatic **Right-to-Left (RTL)** text alignment
-- **Hindi (India)** (`hi-IN`)
-- **Urdu (Pakistan)** (`ur-PK`) – Automatic **Right-to-Left (RTL)** text alignment
-- **Tamil (India)** (`ta-IN`)
+### 1. Priority Hierarchy
+- **🟢 Malayalam (`ml-IN`) – Primary & Default (Highest Priority):**
+  - Starts listening in Malayalam by default.
+  - Generates authentic Malayalam script (മലയാളം) with full conjunct (കൂട്ടക്ഷരങ്ങൾ) and chillu (ചില്ലക്ഷരങ്ങൾ) ligatures.
+- **🟡 Arabic (`ar-SA`) – Secondary:**
+  - Generates authentic Arabic script (العربية) with native bidirectional layout (`dir="auto"` / RTL).
+- **🔵 English (`en-US`) – Tertiary:**
+  - Generates English Latin script.
 
-### 3. Editable Text Editor & Real-Time Counters
-- **Full Text Editing:** Click anywhere to manually edit, type, insert punctuation, or delete text.
+### 2. Intelligent Hysteresis Controller (Loanword Filter)
+- In natural Malayalam speech, speakers frequently use English loanwords (e.g., *"bus"*, *"class"*, *"time"*, *"school"*, *"hospital"*, *"phone"*, *"meeting"*).
+- The Hysteresis Controller prevents erratic language switching: an isolated English word inside Malayalam speech does **not** trigger a language switch.
+- The system only transitions to English when a sustained phrase (3+ consecutive English tokens) is spoken without Malayalam context.
+- Malayalam retains highest priority: any Malayalam utterance immediately re-locks the engine into Malayalam.
+
+### 3. Continuous Recognition & Zero Data Loss
+- When the detected language changes, previously transcribed text is safely retained in the editor.
+- The status pill dynamically updates in real time:
+  - `🟢 Detected: Malayalam (Primary)`
+  - `🟡 Detected: Arabic (Secondary)`
+  - `🔵 Detected: English (Tertiary)`
+
+---
+
+## 🛠️ Complete Feature Set
+
+- **Controls:** Start, Pause, Resume, and Stop with full session state management.
+- **Editable Text Box:** Click anywhere to manually edit, type, insert punctuation, or delete text.
 - **Live Statistics:**
-  - **Total Words:** Count of words in real time.
-  - **Total Characters:** Total character count including spaces.
-  - **Total Characters (excluding spaces):** Exact non-whitespace character count.
-  - Automatically updates as speech streams in or when manually edited.
-
-### 4. Action Toolbar & Productivity
-- **📋 Copy Text:** One-click clipboard copy with animated feedback (`Ctrl + Shift + C`).
-- **📥 Download TXT:** Instant download as a clean timestamped `.txt` document.
-- **🗑️ Clear Text:** Safely clears the editor after user confirmation.
-- **☑️ Select All:** One-click selection of the full transcript.
-- **⏱️ Timer:** Displays elapsed speaking duration in `MM:SS` format.
-- **🌓 Light / Dark Mode:** Professional light theme by default with seamless toggle to dark mode.
-
-### 5. Keyboard Shortcuts
-| Shortcut | Action |
-|---|---|
-| <kbd>Ctrl</kbd> + <kbd>Enter</kbd> (or <kbd>Cmd</kbd> + <kbd>Enter</kbd>) | **Start** / **Resume** / **Pause** recording |
-| <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd> | **Copy** text to clipboard |
-
-### 6. Privacy & Security
-> **Privacy Notice:** Your microphone audio is processed through browser speech recognition. This application does not intentionally store or transmit your audio to external servers.
+  - Total Words
+  - Total Characters
+  - Total Characters (excluding spaces)
+- **Productivity Toolbar:**
+  - **Copy Text:** One-click clipboard copy with visual feedback (`Ctrl + Shift + C`).
+  - **Download TXT:** Instant download as a clean timestamped `.txt` document.
+  - **Select All:** One-click selection of the full transcript.
+  - **Clear Text:** Safely clears the editor after user confirmation.
+- **Timer:** Real-time speaking duration in `MM:SS`.
+- **Theme:** Professional light theme by default with a dark mode toggle (`localStorage` persisted).
+- **Shortcuts:**
+  - <kbd>Ctrl</kbd> + <kbd>Enter</kbd>: Start, Resume, or Pause recording.
+  - <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd>: Copy text.
 
 ---
 
 ## 🚀 How to Run Locally
 
-### Option 1: 1-Click Server Launcher (Recommended)
-1. Double-click **`start-server.bat`** in this folder.
-2. It launches a local server at **`http://localhost:5000/`** and opens your default browser automatically.
+### Option 1: 1-Click Server Launcher
+Double-click **`start-server.bat`** in this folder. It opens `http://localhost:5000/` automatically in your default browser.
 
-### Option 2: Direct Browser Open
-Double-click **`index.html`** to open it directly in **Google Chrome**, **Microsoft Edge**, or **Brave**.
-
----
-
-## 🛠️ Technology Stack
-- **Architecture:** HTML5, CSS3, Vanilla JavaScript (ES6+)
-- **Styling:** Tailwind CSS (Light / Dark mode, centered 900px responsive layout)
-- **Icons:** Lucide Icons
-- **Speech Engine:** Web Speech API (`webkitSpeechRecognition` / `SpeechRecognition`)
-- **Typography:** Google Fonts (`Inter`, `Noto Sans Malayalam`, `Noto Sans Arabic`)
-- **File Export:** Client-side Blob API & Object URL
+### Option 2: Direct Open
+Double-click **`index.html`** in **Google Chrome**, **Microsoft Edge**, or **Brave**.

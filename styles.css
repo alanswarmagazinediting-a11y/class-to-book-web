@@ -41,6 +41,12 @@ textarea::-webkit-scrollbar-thumb:hover {
   background: rgba(148, 163, 184, 0.7);
 }
 
+/* Multi-Script Font Stacks (Malayalam, Arabic, English) */
+#textEditor, #interimStream {
+  font-family: 'Inter', 'Noto Sans Malayalam', 'Noto Sans Arabic', system-ui, sans-serif;
+  line-height: 1.85;
+}
+
 /* Script Font Classes */
 [lang="ml"], .font-malayalam, [data-script="ml"] {
   font-family: 'Noto Sans Malayalam', 'Kartika', 'Nirmala UI', sans-serif;

@@ -98,26 +98,19 @@
       <!-- Top Row: Language Dropdown + Recording Indicator + Status Badge + Timer -->
       <div class="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100 dark:border-slate-800/60">
         
-        <!-- Language Selector -->
-        <div class="flex items-center gap-2">
-          <label for="languageSelect" class="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 flex items-center gap-1">
-            <i data-lucide="globe" class="w-3.5 h-3.5"></i>
-            <span>Language:</span>
-          </label>
-          <div class="relative">
-            <select id="languageSelect" class="bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-750 text-slate-800 dark:text-slate-200 text-xs sm:text-sm font-medium rounded-xl px-3 py-1.5 pr-8 border border-slate-200 dark:border-slate-700 appearance-none focus:outline-none focus:ring-2 focus:ring-indigo-500/30 transition cursor-pointer">
-              <option value="en-US" selected>English (US)</option>
-              <option value="en-GB">English (UK)</option>
-              <option value="ml-IN">Malayalam (India)</option>
-              <option value="ar-SA">Arabic (Saudi Arabia)</option>
-              <option value="hi-IN">Hindi (India)</option>
-              <option value="ur-PK">Urdu (Pakistan)</option>
-              <option value="ta-IN">Tamil (India)</option>
-            </select>
-            <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2.5 text-slate-400">
-              <i data-lucide="chevron-down" class="w-3.5 h-3.5"></i>
-            </div>
+        <!-- Automatic Language Detection Status Indicator -->
+        <div class="flex items-center gap-2.5">
+          <div id="detectedLangPill" class="flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-800 dark:text-emerald-300 shadow-sm transition-all">
+            <span id="detectedLangDot" class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+            <span class="text-slate-500 dark:text-slate-400 font-normal">Detected:</span>
+            <strong id="detectedLangName" class="font-bold">Malayalam</strong>
+            <span id="detectedLangBadge" class="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300 ml-0.5">Primary</span>
           </div>
+
+          <span class="hidden sm:inline-flex items-center gap-1.5 text-[11px] text-slate-400 dark:text-slate-500 font-medium">
+            <i data-lucide="sparkles" class="w-3.5 h-3.5 text-indigo-400"></i>
+            <span>Auto: മലയാളം • العربية • English</span>
+          </span>
         </div>
 
         <!-- Status & Timer Cluster -->
@@ -182,12 +175,12 @@
         
         <!-- Editable Text Box -->
         <textarea id="textEditor" 
-                  placeholder="Click 'Start' and speak into your microphone, or type and edit text manually here..."
-                  dir="ltr"
+                  placeholder="Click 'Start' and speak naturally in Malayalam, Arabic, or English. The app auto-detects language and transcribes live..."
+                  dir="auto"
                   class="w-full flex-1 min-h-[220px] resize-none bg-transparent outline-none text-slate-800 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 text-base sm:text-lg leading-relaxed focus:ring-0 font-normal border-0 p-0 transition-all"></textarea>
 
         <!-- Live Interim Speech Stream Indicator (Unfinalized speech) -->
-        <div id="interimStream" class="hidden mt-2 pt-2 border-t border-slate-100 dark:border-slate-800 text-sm sm:text-base text-indigo-600 dark:text-indigo-400 italic flex items-center gap-2">
+        <div id="interimStream" dir="auto" class="hidden mt-2 pt-2 border-t border-slate-100 dark:border-slate-800 text-sm sm:text-base text-indigo-600 dark:text-indigo-400 italic flex items-center gap-2">
           <span class="inline-block w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span>
           <span id="interimText"></span>
         </div>
