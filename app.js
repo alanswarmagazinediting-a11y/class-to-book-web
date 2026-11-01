@@ -1,60 +1,111 @@
 /**
- * VoiceType – Live Speech to Text
- * Pure Vanilla JavaScript implementation of Web Speech API
- * 
- * APPEND-ONLY Architecture (Zero Duplication):
- * - Uses event.resultIndex to process ONLY new results.
- * - finalTranscript is append-only: new final pieces are added, never reconstructed.
- * - interimTranscript is rebuilt each event (ephemeral, never committed).
- * - On pause/resume/restart, finalTranscript syncs FROM the textarea
- *   so manual edits and previous text are always preserved.
- * - Supports Malayalam (ml-IN, Primary), Arabic (ar-SA, Secondary), and English (en-US, Tertiary).
+ * VoiceType – Live Multilingual Speech to Text
+ *
+ * DUAL-ENGINE ARCHITECTURE
+ * ---------------------------------------------------------------------------
+ * 1. SERVER ENGINE (primary)  – records audio with MediaRecorder, splits it at
+ *    natural silences into disjoint phrase chunks, and posts each chunk to
+ *    /api/transcribe (OpenAI Whisper). Whisper identifies the language FROM THE
+ *    AUDIO and returns text in the original writing system (Malayalam /
+ *    Arabic / English). API key stays server-side.
+ *
+ * 2. BROWSER ENGINE (fallback) – the Web Speech API, used only when the server
+ *    engine is not configured/reachable. It is append-only: it processes only
+ *    new results via event.resultIndex and never rebuilds the transcript.
+ *
+ * DUPLICATE PREVENTION
+ * ---------------------------------------------------------------------------
+ * - Audio chunks are DISJOINT (the recorder is restarted after every phrase),
+ *   so the same audio is never transcribed twice.
+ * - Every recognized segment gets a unique id and is committed exactly once
+ *   (guarded by `committedSegmentIds`).
+ * - The transcript is append-only (`finalTranscript += ...`); it is never
+ *   reconstructed from a cumulative result list.
+ * - Genuine repetitions are preserved: there is NO text-based de-duplication.
  */
 
-// Supported Languages Configuration
+// -------------------------------------------------------------
+// 0. Configuration
+// -------------------------------------------------------------
+
+const SERVER_ASR_ENDPOINT = '/api/transcribe';
+
+// Supported Languages
 const LANG_CONFIG = {
-  MALAYALAM: { code: 'ml-IN', name: 'Malayalam', badge: 'Primary', script: 'മലയാളം' },
-  ARABIC:    { code: 'ar-SA', name: 'Arabic',    badge: 'Secondary', script: 'العربية' },
-  ENGLISH:   { code: 'en-US', name: 'English',   badge: 'Tertiary', script: 'English' }
+  MALAYALAM: { code: 'ml-IN', short: 'ml', name: 'Malayalam', badge: 'Primary', script: 'മലയാളം' },
+  ARABIC:    { code: 'ar-SA', short: 'ar', name: 'Arabic',    badge: 'Secondary', script: 'العربية' },
+  ENGLISH:   { code: 'en-US', short: 'en', name: 'English',   badge: 'Tertiary', script: 'English' }
 };
 
-// Regex patterns for script recognition
 const SCRIPT_PATTERNS = {
   malayalam: /[\u0D00-\u0D7F]/,
   arabic:    /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/,
   english:   /[a-zA-Z]/
 };
 
-// Application State
-let recognition = null;
-let appState = 'idle'; // 'idle' | 'recording' | 'paused' | 'stopped'
-let activeMode = 'auto'; // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
-let currentLangCode = 'ml-IN'; // Default Malayalam (Primary)
+// Voice-activity-detection tuning for the server engine.
+const VAD = {
+  INTERVAL_MS: 60,          // how often the mic level is sampled
+  SPEECH_RMS: 0.018,        // RMS above this counts as speech
+  SILENCE_FLUSH_MS: 850,    // pause length that closes a phrase
+  MIN_CHUNK_MS: 700,        // ignore blips shorter than this
+  MAX_CHUNK_MS: 12000       // hard cap so latency stays low
+};
+
+// -------------------------------------------------------------
+// 1. Application State
+// -------------------------------------------------------------
+
+let recognition = null;          // Web Speech instance (browser engine)
+let engineMode = 'browser';      // 'server' | 'browser'  (active engine)
+let serverConfigured = null;     // null = probing, true/false = known
+
+let appState = 'idle';           // 'idle' | 'recording' | 'paused' | 'stopped'
+let activeMode = 'auto';         // 'auto' | 'ml-IN' | 'ar-SA' | 'en-US'
+let currentLangCode = 'ml-IN';
 let detectedLang = LANG_CONFIG.MALAYALAM;
 
-// ============================================================
-// APPEND-ONLY Transcript Model (Guarantees ZERO duplicate words)
-// ============================================================
-// finalTranscript: accumulates all finalized speech. Grows only via +=.
-//                  Never rebuilt from event.results. Synced from textarea
-//                  before every start/resume so manual edits are kept.
-// (interimTranscript is local to each onresult call — never stored.)
-// ============================================================
+// Append-only transcript model (single source of truth for the editor)
 let finalTranscript = '';
+
+// Segment store — each committed segment is recorded once, by unique id.
+let segmentCounter = 0;
+const committedSegmentIds = new Set();
+const committedSegments = [];    // { id, lang, text }
 
 let isIntentionalStop = false;
 let isRestarting = false;
+let rapidRestartCount = 0;
+let lastEndAt = 0;
 let resultCount = 0;
 let consecutiveEnglishTokens = 0;
 
-// Pending language switch (deferred until AFTER onresult finishes)
-let pendingLangSwitch = null;
+// Server-engine runtime handles
+let micStream = null;
+let audioContext = null;
+let analyser = null;
+let vadBuffer = null;
+let vadTimer = null;
+let chunkRecorder = null;
+let chunkParts = [];
+let chunkStartedAt = 0;
+let lastVoiceAt = 0;
+let sawSpeechInChunk = false;
+let pendingTranscriptions = 0;
+let flushInFlight = false;
+
+// RTL embedding marks so Arabic segments render right-to-left in a plain textarea
+const RLE = '\u202B';
+const PDF = '\u202C';
 
 // Timer State
 let timerInterval = null;
 let elapsedSeconds = 0;
 
-// DOM Elements
+// -------------------------------------------------------------
+// 2. DOM Elements
+// -------------------------------------------------------------
+
 const textEditor = document.getElementById('textEditor');
 const interimStream = document.getElementById('interimStream');
 const interimText = document.getElementById('interimText');
@@ -93,7 +144,7 @@ const toastMsg = document.getElementById('toastMsg');
 const toastIcon = document.getElementById('toastIcon');
 const unsupportedAlert = document.getElementById('unsupportedAlert');
 
-// Diagnostic Debugging Elements
+// Diagnostic elements
 const dbgSupported = document.getElementById('dbgSupported');
 const dbgMicPerm = document.getElementById('dbgMicPerm');
 const dbgStarted = document.getElementById('dbgStarted');
@@ -104,14 +155,13 @@ const dbgResult = document.getElementById('dbgResult');
 const dbgError = document.getElementById('dbgError');
 
 // -------------------------------------------------------------
-// 1. Toast Notification System
+// 3. Toast Notifications
 // -------------------------------------------------------------
+
 let toastTimeout = null;
 
 function showToast(message, type = 'success') {
-  if (toastTimeout) {
-    clearTimeout(toastTimeout);
-  }
+  if (toastTimeout) clearTimeout(toastTimeout);
 
   toastMsg.textContent = message;
 
@@ -131,13 +181,28 @@ function showToast(message, type = 'success') {
   lucide.createIcons();
 
   toast.classList.add('show');
-  toastTimeout = setTimeout(() => {
-    toast.classList.remove('show');
-  }, 2800);
+  toastTimeout = setTimeout(() => toast.classList.remove('show'), 2800);
 }
 
 // -------------------------------------------------------------
-// 2. Microphone Permissions & Support Verification
+// 4. Interim / Processing Indicator
+// -------------------------------------------------------------
+
+function showInterim(text) {
+  if (!interimStream || !interimText) return;
+  if (!text) return hideInterim();
+  interimText.textContent = text;
+  interimStream.classList.remove('hidden');
+}
+
+function hideInterim() {
+  if (!interimStream || !interimText) return;
+  interimText.textContent = '';
+  interimStream.classList.add('hidden');
+}
+
+// -------------------------------------------------------------
+// 5. Microphone Permission & Support
 // -------------------------------------------------------------
 
 async function checkMicrophonePermission() {
@@ -145,9 +210,7 @@ async function checkMicrophonePermission() {
     try {
       const permissionStatus = await navigator.permissions.query({ name: 'microphone' });
       updateMicPermissionUI(permissionStatus.state);
-      permissionStatus.onchange = () => {
-        updateMicPermissionUI(permissionStatus.state);
-      };
+      permissionStatus.onchange = () => updateMicPermissionUI(permissionStatus.state);
     } catch (err) {
       updateMicPermissionUI('Supported (Prompt on Start)');
     }
@@ -171,43 +234,13 @@ function updateMicPermissionUI(state) {
 }
 
 // -------------------------------------------------------------
-// 3. Language Detection & Hysteresis Controller
+// 6. Language Helpers
 // -------------------------------------------------------------
 
-/**
- * Evaluates spoken phrase for Malayalam, Arabic, or English
- * Applies hysteresis to ignore 1-2 isolated English loanwords in Malayalam
- */
-function evaluateSpokenLanguage(phrase) {
-  if (!phrase || phrase.trim().length === 0) return null;
-
-  const hasMalayalam = SCRIPT_PATTERNS.malayalam.test(phrase);
-  const hasArabic = SCRIPT_PATTERNS.arabic.test(phrase);
-  const englishMatches = phrase.match(/[a-zA-Z]+/g) || [];
-
-  // 1. Arabic: High confidence on Arabic script
-  if (hasArabic) {
-    consecutiveEnglishTokens = 0;
-    return LANG_CONFIG.ARABIC;
-  }
-
-  // 2. Malayalam: Highest priority
-  if (hasMalayalam) {
-    consecutiveEnglishTokens = 0;
-    return LANG_CONFIG.MALAYALAM;
-  }
-
-  // 3. English Hysteresis Check
-  if (englishMatches.length > 0) {
-    consecutiveEnglishTokens += englishMatches.length;
-    if (consecutiveEnglishTokens >= 3) {
-      return LANG_CONFIG.ENGLISH;
-    }
-  } else {
-    consecutiveEnglishTokens = 0;
-  }
-
-  return null;
+function langByShort(short) {
+  if (!short) return null;
+  const s = String(short).toLowerCase().slice(0, 2);
+  return Object.values(LANG_CONFIG).find(l => l.short === s) || null;
 }
 
 function updateLanguageUI(langObj) {
@@ -215,9 +248,7 @@ function updateLanguageUI(langObj) {
   detectedLangName.textContent = langObj.name;
   detectedLangBadge.textContent = langObj.badge;
 
-  if (dbgLang) {
-    dbgLang.textContent = `${langObj.code} (${langObj.name})`;
-  }
+  if (dbgLang) dbgLang.textContent = `${langObj.code} (${langObj.name})`;
 
   if (langObj.code === LANG_CONFIG.MALAYALAM.code) {
     detectedLangPill.className = 'flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-semibold bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-800 dark:text-emerald-300 shadow-sm transition-all';
@@ -235,94 +266,349 @@ function updateLanguageUI(langObj) {
 }
 
 /**
- * Schedule a language switch to happen AFTER onresult finishes.
- * This prevents commitSessionText() from running mid-handler,
- * which was the primary source of word duplication.
+ * Browser-engine only: infer language from recognized TEXT via script ranges.
+ * (The server engine detects language from the AUDIO and does not need this.)
  */
-function requestLanguageSwitch(newCode) {
-  if (currentLangCode === newCode) return;
-  pendingLangSwitch = newCode;
-}
+function evaluateSpokenLanguage(phrase) {
+  if (!phrase || phrase.trim().length === 0) return null;
 
-function applyPendingLanguageSwitch() {
-  if (!pendingLangSwitch) return;
-  const newCode = pendingLangSwitch;
-  pendingLangSwitch = null;
+  const hasMalayalam = SCRIPT_PATTERNS.malayalam.test(phrase);
+  const hasArabic = SCRIPT_PATTERNS.arabic.test(phrase);
+  const englishMatches = phrase.match(/[a-zA-Z]+/g) || [];
 
-  currentLangCode = newCode;
-  const langObj = Object.values(LANG_CONFIG).find(l => l.code === newCode) || LANG_CONFIG.MALAYALAM;
-  updateLanguageUI(langObj);
+  if (hasArabic) { consecutiveEnglishTokens = 0; return LANG_CONFIG.ARABIC; }
+  if (hasMalayalam) { consecutiveEnglishTokens = 0; return LANG_CONFIG.MALAYALAM; }
 
-  if (recognition) {
-    recognition.lang = newCode;
-
-    // If currently recording, safely restart with the new language model
-    if (appState === 'recording' && !isRestarting) {
-      // Do NOT re-read the textarea here: finalTranscript already holds the
-      // finalized text. Reading it would promote provisional interim text and
-      // risk duplicating it once the engine restarts in the new language.
-      isRestarting = true;
-      try {
-        recognition.stop(); // will trigger onend → auto-restart
-      } catch (e) {
-        isRestarting = false;
-      }
-    }
+  if (englishMatches.length > 0) {
+    consecutiveEnglishTokens += englishMatches.length;
+    if (consecutiveEnglishTokens >= 3) return LANG_CONFIG.ENGLISH;
+  } else {
+    consecutiveEnglishTokens = 0;
   }
-}
-
-function switchLanguage(newCode, isUserClick = false) {
-  if (currentLangCode === newCode && !isUserClick) return;
-
-  currentLangCode = newCode;
-  const langObj = Object.values(LANG_CONFIG).find(l => l.code === newCode) || LANG_CONFIG.MALAYALAM;
-  updateLanguageUI(langObj);
-
-  if (recognition) {
-    recognition.lang = newCode;
-
-    // If currently recording, safely restart with the new language model
-    if (appState === 'recording' && !isRestarting) {
-      // Do NOT re-read the textarea here: finalTranscript already holds the
-      // finalized text. Reading it would promote provisional interim text and
-      // risk duplicating it once the engine restarts.
-      isRestarting = true;
-      try {
-        recognition.stop(); // triggers onend → auto-restart
-      } catch (e) {
-        isRestarting = false;
-      }
-    }
-  }
-
-  if (isUserClick) {
-    showToast(`Language set to ${langObj.name}`, 'info');
-  }
+  return null;
 }
 
 // -------------------------------------------------------------
-// 4. Web Speech API Lifecycle & Engine Management
+// 7. Segment Store — commit each recognized segment EXACTLY ONCE
+// -------------------------------------------------------------
+
+function makeSegmentId(prefix) {
+  segmentCounter += 1;
+  return `${prefix}-${segmentCounter}-${Date.now()}`;
+}
+
+/** Append text to the transcript with correct spacing / sentence breaks. */
+function appendToTranscript(text) {
+  const clean = text.trim();
+  if (!clean) return;
+
+  let out = finalTranscript;
+
+  if (out.length > 0 && !/\s$/.test(out)) {
+    // Add a space so words never fuse; add a sentence break after terminal
+    // punctuation so distinct sentences stay readable.
+    out += /[.!?।؟]$/.test(out.trim()) ? '\n' : ' ';
+  }
+
+  finalTranscript = out + clean;
+  textEditor.value = finalTranscript;
+  updateCounters();
+  textEditor.scrollTop = textEditor.scrollHeight;
+}
+
+/**
+ * Commit a recognized segment once. Duplicate ids are ignored, so a segment
+ * can never be written to the transcript twice.
+ * NOTE: no text-based filtering — intentional repetitions are preserved.
+ */
+function commitSegment(langCode, text, providedId) {
+  const id = providedId || makeSegmentId('seg');
+  if (committedSegmentIds.has(id)) return false;
+  if (!text || !text.trim()) return false;
+
+  const langObj = Object.values(LANG_CONFIG).find(l => l.code === langCode) || detectedLang;
+  const rendered = langObj.code === LANG_CONFIG.ARABIC.code ? RLE + text.trim() + PDF : text.trim();
+
+  committedSegmentIds.add(id);
+  committedSegments.push({ id, lang: langObj.code, text: text.trim() });
+
+  appendToTranscript(rendered);
+
+  // Language indicator follows the language actually used for this segment.
+  if (langObj.code !== detectedLang.code) updateLanguageUI(langObj);
+
+  recordSegmentDiagnostic();
+  return true;
+}
+
+function recordSegmentDiagnostic() {
+  if (!dbgResult) return;
+  const last = committedSegments[committedSegments.length - 1];
+  dbgResult.textContent = `Segments: ${committedSegments.length} | "${(last ? last.text : '').slice(-35)}"`;
+  dbgResult.className = 'font-semibold text-emerald-400 text-xs mt-0.5 truncate';
+}
+
+function clearSegments() {
+  segmentCounter = 0;
+  committedSegmentIds.clear();
+  committedSegments.length = 0;
+}
+
+// -------------------------------------------------------------
+// 8. SERVER ENGINE — MediaRecorder + Whisper via /api/transcribe
+// -------------------------------------------------------------
+
+async function probeServerEngine() {
+  try {
+    const res = await fetch(SERVER_ASR_ENDPOINT, { method: 'GET', cache: 'no-store' });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    serverConfigured = Boolean(data && data.configured);
+  } catch (err) {
+    serverConfigured = false;
+  }
+
+  if (dbgSupported) {
+    if (serverConfigured) {
+      dbgSupported.textContent = 'Yes (Whisper Server ASR)';
+      dbgSupported.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+    } else if (window.SpeechRecognition || window.webkitSpeechRecognition) {
+      dbgSupported.textContent = 'Yes (Browser Web Speech)';
+      dbgSupported.className = 'font-bold text-amber-400 text-xs mt-0.5';
+    } else {
+      dbgSupported.textContent = 'No (Unsupported)';
+      dbgSupported.className = 'font-bold text-rose-400 text-xs mt-0.5';
+    }
+  }
+  return serverConfigured;
+}
+
+function pickRecorderMime() {
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return '';
+  for (const type of candidates) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return '';
+}
+
+function beginChunk() {
+  if (!micStream || appState !== 'recording') return;
+
+  const mime = pickRecorderMime();
+  try {
+    chunkRecorder = mime ? new MediaRecorder(micStream, { mimeType: mime })
+                         : new MediaRecorder(micStream);
+  } catch (err) {
+    console.warn('MediaRecorder unavailable:', err);
+    return;
+  }
+
+  chunkParts = [];
+  chunkStartedAt = Date.now();
+  lastVoiceAt = Date.now();
+  sawSpeechInChunk = false;
+
+  chunkRecorder.ondataavailable = (e) => { if (e.data && e.data.size) chunkParts.push(e.data); };
+  chunkRecorder.onstop = () => {
+    const blob = new Blob(chunkParts, { type: chunkRecorder.mimeType || 'audio/webm' });
+    chunkParts = [];
+    sendChunkForTranscription(blob);
+    if (appState === 'recording') beginChunk();
+  };
+
+  chunkRecorder.start();
+}
+
+function flushChunk() {
+  if (flushInFlight) return;
+  if (!chunkRecorder || chunkRecorder.state !== 'recording') return;
+  flushInFlight = true;
+  try {
+    chunkRecorder.stop();
+  } catch (err) {
+    console.warn('Chunk flush notice:', err);
+  } finally {
+    // Released on the next tick; onstop fires synchronously after stop().
+    setTimeout(() => { flushInFlight = false; }, 0);
+  }
+}
+
+function startVadLoop() {
+  if (vadTimer) return;
+  vadTimer = setInterval(() => {
+    if (appState !== 'recording' || !analyser) return;
+
+    analyser.getByteTimeDomainData(vadBuffer);
+
+    let sum = 0;
+    for (let i = 0; i < vadBuffer.length; i++) {
+      const v = (vadBuffer[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / vadBuffer.length);
+    const now = Date.now();
+
+    if (rms > VAD.SPEECH_RMS) {
+      sawSpeechInChunk = true;
+      lastVoiceAt = now;
+      if (dbgSpeech) {
+        dbgSpeech.textContent = 'Speech Detected';
+        dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+      }
+    }
+
+    const chunkAge = now - chunkStartedAt;
+    const silentFor = now - lastVoiceAt;
+
+    if (sawSpeechInChunk && silentFor > VAD.SILENCE_FLUSH_MS && chunkAge > VAD.MIN_CHUNK_MS) {
+      flushChunk();                       // phrase finished — transcribe it
+    } else if (chunkAge > VAD.MAX_CHUNK_MS) {
+      flushChunk();                       // safety cap for very long speech
+    }
+  }, VAD.INTERVAL_MS);
+}
+
+function stopVadLoop() {
+  if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = String(reader.result || '');
+      resolve(result.slice(result.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function sendChunkForTranscription(blob) {
+  if (!blob || blob.size < 1500) return;   // silence / blip — nothing to send
+
+  pendingTranscriptions += 1;
+  showInterim(pendingTranscriptions > 1
+    ? `⏳ Transcribing ${pendingTranscriptions} segments…`
+    : '⏳ Transcribing…');
+
+  const languageHint = activeMode === 'auto' ? null : activeMode.split('-')[0];
+
+  try {
+    const base64 = await blobToBase64(blob);
+    const res = await fetch(SERVER_ASR_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio: base64, mimeType: blob.type || 'audio/webm', languageHint })
+    });
+
+    if (!res.ok) {
+      const info = await res.json().catch(() => ({}));
+      setErrorDiagnostic(`Error: ${info.error || res.status}`);
+      if (res.status === 503) {
+        serverConfigured = false;
+        showToast('Server transcription is not configured (missing API key).', 'error');
+      } else if (res.status === 504) {
+        showToast('Transcription timed out. Check your connection.', 'warning');
+      } else {
+        showToast('Transcription failed. Retrying on next phrase.', 'warning');
+      }
+      return;
+    }
+
+    const data = await res.json();
+
+    if (data && data.text) {
+      const langObj = langByShort(data.language) || detectedLang;
+      // Unique id per chunk => committed exactly once.
+      commitSegment(langObj.code, data.text, makeSegmentId('chunk'));
+    } else if (dbgResult) {
+      recordSegmentDiagnostic();
+    }
+
+    setErrorDiagnostic('None');
+  } catch (err) {
+    setErrorDiagnostic('Error: network');
+    showToast('Network interruption while transcribing. Will continue.', 'warning');
+  } finally {
+    pendingTranscriptions = Math.max(0, pendingTranscriptions - 1);
+    if (pendingTranscriptions === 0) {
+      if (appState === 'recording') showInterim('🎙 Listening…');
+      else hideInterim();
+    } else {
+      showInterim(`⏳ Transcribing ${pendingTranscriptions} segments…`);
+    }
+  }
+}
+
+function setErrorDiagnostic(text) {
+  if (!dbgError) return;
+  dbgError.textContent = text;
+  dbgError.className = text === 'None'
+    ? 'font-semibold text-slate-400 text-xs mt-0.5 truncate'
+    : 'font-semibold text-rose-400 text-xs mt-0.5 truncate';
+}
+
+async function startServerEngine() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
+    });
+  } catch (err) {
+    updateMicPermissionUI('denied');
+    showToast('Microphone access blocked. Allow it in the Chrome URL bar and retry.', 'error');
+    return false;
+  }
+
+  updateMicPermissionUI('granted');
+
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioContext.createMediaStreamSource(micStream);
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 2048;
+  vadBuffer = new Uint8Array(analyser.fftSize);
+  source.connect(analyser);
+
+  if (dbgAudio) { dbgAudio.textContent = 'Yes (Mic Streaming)'; dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
+  if (dbgStarted) { dbgStarted.textContent = 'Yes (Server Engine)'; dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
+
+  beginChunk();
+  startVadLoop();
+  return true;
+}
+
+function stopServerEngine() {
+  stopVadLoop();
+
+  if (chunkRecorder && chunkRecorder.state === 'recording') {
+    try { chunkRecorder.stop(); } catch (err) { /* noop */ }
+  }
+  chunkRecorder = null;
+
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+  }
+  if (audioContext && audioContext.state !== 'closed') {
+    audioContext.close().catch(() => {});
+  }
+  audioContext = null;
+  analyser = null;
+  vadBuffer = null;
+
+  if (dbgAudio) { dbgAudio.textContent = 'No'; dbgAudio.className = 'font-bold text-slate-400 text-xs mt-0.5'; }
+  if (dbgStarted) { dbgStarted.textContent = 'No (Ended)'; dbgStarted.className = 'font-bold text-slate-400 text-xs mt-0.5'; }
+  if (dbgSpeech) { dbgSpeech.textContent = 'No'; dbgSpeech.className = 'font-bold text-slate-400 text-xs mt-0.5'; }
+}
+
+// -------------------------------------------------------------
+// 9. BROWSER ENGINE — Web Speech API (fallback), append-only
 // -------------------------------------------------------------
 
 function initSpeechRecognition() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
-  if (!SpeechRecognition) {
-    if (unsupportedAlert) unsupportedAlert.classList.remove('hidden');
-    if (dbgSupported) {
-      dbgSupported.textContent = 'No (Unsupported Browser)';
-      dbgSupported.className = 'font-bold text-rose-400 text-xs mt-0.5';
-    }
-    startBtn.disabled = true;
-    updateStatus('unsupported');
-    return null;
-  }
-
-  if (unsupportedAlert) unsupportedAlert.classList.add('hidden');
-  if (dbgSupported) {
-    dbgSupported.textContent = 'Yes (webkitSpeechRecognition)';
-    dbgSupported.className = 'font-bold text-emerald-400 text-xs mt-0.5';
-  }
+  if (!SpeechRecognition) return null;
 
   const rec = new SpeechRecognition();
   rec.continuous = true;
@@ -330,60 +616,26 @@ function initSpeechRecognition() {
   rec.maxAlternatives = 1;
   rec.lang = currentLangCode;
 
-  // On Start
   rec.onstart = () => {
     isRestarting = false;
+    rapidRestartCount = 0;
     appState = 'recording';
     updateControls();
     updateStatus('listening');
     startTimer();
-
-    if (dbgStarted) {
-      dbgStarted.textContent = 'Yes (Active)';
-      dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5';
-    }
-    if (dbgAudio) {
-      dbgAudio.textContent = 'Connecting...';
-      dbgAudio.className = 'font-bold text-amber-400 text-xs mt-0.5';
-    }
-    if (dbgSpeech) {
-      dbgSpeech.textContent = 'Waiting for voice...';
-      dbgSpeech.className = 'font-bold text-slate-400 text-xs mt-0.5';
-    }
+    if (dbgStarted) { dbgStarted.textContent = 'Yes (Browser Engine)'; dbgStarted.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
+    if (dbgAudio) { dbgAudio.textContent = 'Connecting...'; dbgAudio.className = 'font-bold text-amber-400 text-xs mt-0.5'; }
   };
 
-  // Audio Capture Started
   rec.onaudiostart = () => {
-    if (dbgAudio) {
-      dbgAudio.textContent = 'Yes (Mic Streaming)';
-      dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5';
-    }
-  };
-
-  // Sound/Speech Detected
-  rec.onsoundstart = () => {
-    if (dbgSpeech) {
-      dbgSpeech.textContent = 'Sound Detected';
-      dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5';
-    }
+    if (dbgAudio) { dbgAudio.textContent = 'Yes (Mic Streaming)'; dbgAudio.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
   };
 
   rec.onspeechstart = () => {
-    if (dbgSpeech) {
-      dbgSpeech.textContent = 'Speech Detected';
-      dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5';
-    }
+    if (dbgSpeech) { dbgSpeech.textContent = 'Speech Detected'; dbgSpeech.className = 'font-bold text-emerald-400 text-xs mt-0.5'; }
   };
 
-  // -----------------------------------------------------------
-  // APPEND-ONLY SPEECH EVENT HANDLER (ZERO DUPLICATION)
-  // -----------------------------------------------------------
-  // KEY RULES:
-  //   1. Loop starts at event.resultIndex — skip already-processed results.
-  //   2. finalTranscript grows via += only — never rebuilt from scratch.
-  //   3. interimTranscript is local and ephemeral — rebuilt each event.
-  //   4. No commitSessionText(), no persistedTranscript, no reconstruction.
-  // -----------------------------------------------------------
+  // APPEND-ONLY handler — starts at event.resultIndex, never rebuilds.
   rec.onresult = (event) => {
     let currentInterim = '';
 
@@ -392,158 +644,130 @@ function initSpeechRecognition() {
       const piece = result[0].transcript;
 
       if (result.isFinal) {
-        // Append this new final piece — it has never been seen before
-        finalTranscript += piece;
-
-        // Auto language detection on the newly finalized text
-        if (activeMode === 'auto') {
-          const detected = evaluateSpokenLanguage(piece);
-          if (detected && detected.code !== currentLangCode) {
-            // DEFER the switch — do NOT call switchLanguage() mid-handler
-            requestLanguageSwitch(detected.code);
-          }
-        }
+        // Unique per (session, resultIndex, index) => committed exactly once.
+        commitSegment(
+          (activeMode === 'auto'
+            ? (evaluateSpokenLanguage(piece) || detectedLang).code
+            : currentLangCode),
+          piece,
+          `ws-${sessionSeq}-${event.resultIndex}-${i}`
+        );
       } else {
         currentInterim += piece;
       }
     }
 
     resultCount = event.results.length;
-
-    // Render: all finalized text + live interim preview
-    textEditor.value = finalTranscript + currentInterim;
     updateCounters();
-
-    // Auto-scroll textarea to bottom
     textEditor.scrollTop = textEditor.scrollHeight;
 
-    // Update Diagnostic Panel
-    if (dbgResult) {
-      const snippet = (currentInterim || finalTranscript).slice(-35);
-      dbgResult.textContent = `Count: ${resultCount} | "${snippet}"`;
-      dbgResult.className = 'font-semibold text-emerald-400 text-xs mt-0.5 truncate';
-    }
-
-    // Apply deferred language switch AFTER all result processing is done
-    if (pendingLangSwitch) {
-      applyPendingLanguageSwitch();
-    }
+    if (currentInterim) showInterim(currentInterim);
+    else hideInterim();
   };
 
-  // Error Event
   rec.onerror = (event) => {
-    console.warn('Speech recognition notice:', event.error);
-
-    if (dbgError) {
-      dbgError.textContent = `Error: ${event.error} (${new Date().toLocaleTimeString()})`;
-      dbgError.className = 'font-semibold text-rose-400 text-xs mt-0.5 truncate';
-    }
+    setErrorDiagnostic(`Error: ${event.error}`);
 
     if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-      showToast('Microphone access blocked. Please click the lock icon in Chrome URL bar and allow microphone.', 'error');
+      showToast('Microphone access blocked. Allow it in the Chrome URL bar.', 'error');
       stopSession();
       updateMicPermissionUI('denied');
       return;
     }
-
     if (event.error === 'audio-capture') {
-      showToast('No microphone found. Please connect or select a microphone.', 'error');
+      showToast('No microphone found. Please connect one.', 'error');
       stopSession();
       return;
     }
-
-    if (event.error === 'no-speech') {
-      // Normal pause in speech: do not stop or restart!
-      return;
-    }
-
+    if (event.error === 'no-speech') return;   // normal pause in speech
     if (event.error === 'network') {
-      showToast('Network error: Unable to connect to Google Speech servers. Check internet connection.', 'error');
+      showToast('Network error reaching the speech service.', 'error');
     }
   };
 
-  // End Event
   rec.onend = () => {
     isRestarting = false;
+    hideInterim();
 
-    if (isIntentionalStop) {
-      // Explicit Pause / Stop: preserve exactly what the user currently sees
-      // (last finalized text plus the final interim preview) and any manual edits.
-      finalTranscript = textEditor.value;
-    } else {
-      // Spontaneous end (silence) or language-switch restart: drop the ephemeral
-      // interim preview and keep ONLY the finalized text. This guarantees that
-      // nothing can be committed twice when the engine auto-restarts.
-      textEditor.value = finalTranscript;
-    }
-    updateCounters();
-
-    if (dbgStarted) {
-      dbgStarted.textContent = 'No (Ended)';
-      dbgStarted.className = 'font-bold text-slate-400 text-xs mt-0.5';
-    }
-    if (dbgAudio) {
-      dbgAudio.textContent = 'No';
-      dbgAudio.className = 'font-bold text-slate-400 text-xs mt-0.5';
-    }
-    if (dbgSpeech) {
-      dbgSpeech.textContent = 'No';
-      dbgSpeech.className = 'font-bold text-slate-400 text-xs mt-0.5';
-    }
-
-    // Auto-restart if still in recording mode and not intentionally stopped
     if (appState === 'recording' && !isIntentionalStop) {
+      const now = Date.now();
+      rapidRestartCount = (now - lastEndAt < 400) ? rapidRestartCount + 1 : 0;
+      lastEndAt = now;
+
+      if (rapidRestartCount > 5) {
+        appState = 'stopped';
+        isIntentionalStop = true;
+        updateStatus('stopped');
+        updateControls();
+        stopTimer();
+        showToast('Recognition stopped after repeated errors. Press Start to retry.', 'error');
+        return;
+      }
+
       setTimeout(() => {
         if (appState === 'recording') {
-          try {
-            rec.lang = currentLangCode;
-            rec.start();
-          } catch (err) {
-            console.warn('Auto-restart notice:', err);
-          }
+          try { rec.lang = currentLangCode; rec.start(); }
+          catch (err) { console.warn('Auto-restart notice:', err); }
         }
       }, 150);
-    } else if (appState === 'paused') {
-      updateStatus('paused');
-      updateControls();
-      stopTimer();
-    } else {
-      updateStatus('stopped');
-      updateControls();
-      stopTimer();
+      return;
     }
+
+    if (appState === 'paused') { updateStatus('paused'); updateControls(); stopTimer(); }
+    else if (appState === 'stopped') { updateStatus('stopped'); updateControls(); stopTimer(); }
   };
 
   return rec;
 }
 
 // -------------------------------------------------------------
-// 5. Session Controls (Start, Pause, Resume, Stop)
+// 10. Session Controls (route to the active engine)
 // -------------------------------------------------------------
 
-function startSession() {
-  if (!recognition) {
-    recognition = initSpeechRecognition();
-    if (!recognition) return;
-  }
+let sessionSeq = 0;
 
+async function startSession() {
   isIntentionalStop = false;
   isRestarting = false;
+  resultCount = 0;
+  sessionSeq += 1;
 
-  // Sync finalTranscript from current textarea content (preserves manual edits)
   finalTranscript = textEditor.value;
+  setErrorDiagnostic('None');
 
-  // Set language
-  recognition.lang = currentLangCode;
+  // Decide the engine once (probe if not yet known).
+  if (serverConfigured === null) await probeServerEngine();
 
-  if (dbgError) {
-    dbgError.textContent = 'None';
-    dbgError.className = 'font-semibold text-slate-400 text-xs mt-0.5 truncate';
+  if (serverConfigured) {
+    engineMode = 'server';
+    const ok = await startServerEngine();
+    if (ok) {
+      appState = 'recording';
+      updateControls();
+      updateStatus('listening');
+      startTimer();
+      showInterim('🎙 Listening…');
+      showToast('Listening — language is detected automatically from your voice.', 'info');
+    }
+    return;
   }
 
+  // Fallback: browser Web Speech API
+  engineMode = 'browser';
+  if (!recognition) recognition = initSpeechRecognition();
+
+  if (!recognition) {
+    if (unsupportedAlert) unsupportedAlert.classList.remove('hidden');
+    updateStatus('unsupported');
+    if (startBtn) startBtn.disabled = true;
+    showToast('No speech engine available in this browser. Use Google Chrome.', 'error');
+    return;
+  }
+
+  recognition.lang = currentLangCode;
   try {
     recognition.start();
-    showToast(`Microphone active. Listening in ${detectedLang.name}...`, 'info');
+    showToast(`Microphone active (browser engine). Listening in ${detectedLang.name}…`, 'info');
   } catch (err) {
     console.warn('Recognition start caught:', err);
   }
@@ -555,48 +779,52 @@ function pauseSession() {
   appState = 'paused';
   isIntentionalStop = true;
 
-  try {
-    recognition.stop();
-  } catch (err) {
-    console.warn(err);
+  if (engineMode === 'server') {
+    flushChunk();               // transcribe whatever phrase was in progress
+    stopVadLoop();
+    if (chunkRecorder) { try { chunkRecorder.stop(); } catch (e) { /* noop */ } }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  } else if (recognition) {
+    try { recognition.stop(); } catch (err) { console.warn(err); }
   }
 
-  // Sync finalTranscript from textarea (captures everything including interim
-  // that was being shown — user sees it, so it becomes the persisted state)
-  finalTranscript = textEditor.value;
-  updateCounters();
-
+  hideInterim();
   stopTimer();
   updateStatus('paused');
   updateControls();
   showToast('Recording paused. Text preserved.', 'info');
 }
 
-function resumeSession() {
+async function resumeSession() {
   if (appState !== 'paused') return;
 
   isIntentionalStop = false;
-
-  // Sync finalTranscript from textarea (user may have edited text while paused)
   finalTranscript = textEditor.value;
 
-  // Add a trailing space if needed so new speech doesn't merge with last word
-  if (finalTranscript.length > 0 &&
-      !finalTranscript.endsWith(' ') &&
-      !finalTranscript.endsWith('\n')) {
-    finalTranscript += ' ';
-    textEditor.value = finalTranscript;
+  if (engineMode === 'server') {
+    const ok = await startServerEngine();
+    if (ok) {
+      appState = 'recording';
+      updateControls();
+      updateStatus('listening');
+      startTimer();
+      showInterim('🎙 Listening…');
+      showToast('Resumed — listening.', 'info');
+    }
+    return;
   }
 
-  recognition.lang = currentLangCode;
+  if (!recognition) recognition = initSpeechRecognition();
+  if (!recognition) return;
 
+  recognition.lang = currentLangCode;
   try {
     recognition.start();
     appState = 'recording';
     updateControls();
     updateStatus('listening');
     startTimer();
-    showToast(`Resuming (${detectedLang.name})...`, 'info');
+    showToast(`Resumed (${detectedLang.name})…`, 'info');
   } catch (err) {
     console.warn('Resume notice:', err);
   }
@@ -608,15 +836,16 @@ function stopSession() {
   appState = 'stopped';
   isIntentionalStop = true;
 
-  try {
-    recognition.stop();
-  } catch (err) {
-    console.warn(err);
+  if (engineMode === 'server') {
+    flushChunk();
+    stopServerEngine();
+  } else if (recognition) {
+    try { recognition.stop(); } catch (err) { console.warn(err); }
   }
 
+  hideInterim();
   finalTranscript = textEditor.value;
   updateCounters();
-
   stopTimer();
   updateStatus('stopped');
   updateControls();
@@ -624,25 +853,19 @@ function stopSession() {
 }
 
 // -------------------------------------------------------------
-// 6. Controls & Status Indicator Management
+// 11. Controls & Status
 // -------------------------------------------------------------
 
 function updateControls() {
   if (appState === 'recording') {
-    startBtn.disabled = true;
-    pauseBtn.disabled = false;
-    resumeBtn.disabled = true;
-    stopBtn.disabled = false;
+    startBtn.disabled = true;  pauseBtn.disabled = false;
+    resumeBtn.disabled = true; stopBtn.disabled = false;
   } else if (appState === 'paused') {
-    startBtn.disabled = true;
-    pauseBtn.disabled = true;
-    resumeBtn.disabled = false;
-    stopBtn.disabled = false;
+    startBtn.disabled = true;  pauseBtn.disabled = true;
+    resumeBtn.disabled = false; stopBtn.disabled = false;
   } else {
-    startBtn.disabled = false;
-    pauseBtn.disabled = true;
-    resumeBtn.disabled = true;
-    stopBtn.disabled = true;
+    startBtn.disabled = false; pauseBtn.disabled = true;
+    resumeBtn.disabled = true;  stopBtn.disabled = true;
   }
 }
 
@@ -673,7 +896,7 @@ function updateStatus(status) {
 }
 
 // -------------------------------------------------------------
-// 7. Language Switch Chips (Auto + 1-Tap Fast Selection)
+// 12. Language Chips (Auto detect + optional manual hint)
 // -------------------------------------------------------------
 
 langChips.forEach(chip => {
@@ -685,38 +908,32 @@ langChips.forEach(chip => {
     activeMode = mode;
 
     if (mode === 'auto') {
-      switchLanguage(LANG_CONFIG.MALAYALAM.code, true);
-      showToast('Switched to Auto-Detect mode (Malayalam primary).', 'info');
+      currentLangCode = LANG_CONFIG.MALAYALAM.code;
+      updateLanguageUI(LANG_CONFIG.MALAYALAM);
+      showToast('Auto-detect enabled — language identified from your voice.', 'info');
     } else {
-      switchLanguage(mode, true);
+      currentLangCode = mode;
+      const langObj = Object.values(LANG_CONFIG).find(l => l.code === mode) || LANG_CONFIG.MALAYALAM;
+      updateLanguageUI(langObj);
+      showToast(`Language hint set to ${langObj.name}.`, 'info');
     }
   });
 });
 
 // -------------------------------------------------------------
-// 8. Timer System (MM:SS)
+// 13. Timer (MM:SS)
 // -------------------------------------------------------------
 
 function startTimer() {
   if (timerInterval) return;
-  timerInterval = setInterval(() => {
-    elapsedSeconds++;
-    renderTimer();
-  }, 1000);
+  timerInterval = setInterval(() => { elapsedSeconds++; renderTimer(); }, 1000);
 }
 
 function stopTimer() {
-  if (timerInterval) {
-    clearInterval(timerInterval);
-    timerInterval = null;
-  }
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
-function resetTimer() {
-  stopTimer();
-  elapsedSeconds = 0;
-  renderTimer();
-}
+function resetTimer() { stopTimer(); elapsedSeconds = 0; renderTimer(); }
 
 function renderTimer() {
   const m = String(Math.floor(elapsedSeconds / 60)).padStart(2, '0');
@@ -725,41 +942,30 @@ function renderTimer() {
 }
 
 // -------------------------------------------------------------
-// 9. Word & Character Counters
+// 14. Word & Character Counters
 // -------------------------------------------------------------
 
 function updateCounters() {
   const text = textEditor.value;
-
-  // Total words: split by whitespace, filter empty tokens
   const words = text.trim().length > 0 ? text.trim().split(/\s+/).filter(Boolean).length : 0;
   totalWordsEl.textContent = words.toLocaleString();
-
-  // Total characters (including spaces)
   totalCharsEl.textContent = text.length.toLocaleString();
-
-  // Total characters (excluding spaces)
-  const noSpaces = text.replace(/\s/g, '').length;
-  totalCharsNoSpaceEl.textContent = noSpaces.toLocaleString();
+  totalCharsNoSpaceEl.textContent = text.replace(/\s/g, '').length.toLocaleString();
 }
 
-// Synchronize manual typing in textarea with finalTranscript
+// Manual edits stay authoritative and are never overwritten mid-recording.
 textEditor.addEventListener('input', () => {
   finalTranscript = textEditor.value;
   updateCounters();
 });
 
 // -------------------------------------------------------------
-// 10. Action Buttons (Copy, Download TXT, Clear, Select All)
+// 15. Actions (Copy, Download TXT, Clear, Select All)
 // -------------------------------------------------------------
 
-// Copy Text
 copyBtn.addEventListener('click', async () => {
   const text = textEditor.value.trim();
-  if (!text) {
-    showToast('There is no text to copy!', 'warning');
-    return;
-  }
+  if (!text) { showToast('There is no text to copy!', 'warning'); return; }
 
   try {
     await navigator.clipboard.writeText(text);
@@ -767,7 +973,6 @@ copyBtn.addEventListener('click', async () => {
     copyIcon.setAttribute('data-lucide', 'check');
     copyBtn.classList.add('bg-emerald-50', 'text-emerald-700', 'border-emerald-300', 'dark:bg-emerald-950/50', 'dark:text-emerald-300');
     lucide.createIcons();
-
     showToast('Text copied to clipboard!', 'success');
 
     setTimeout(() => {
@@ -782,13 +987,9 @@ copyBtn.addEventListener('click', async () => {
   }
 });
 
-// Download TXT
 downloadTxtBtn.addEventListener('click', () => {
   const text = textEditor.value.trim();
-  if (!text) {
-    showToast('Editor is empty. Nothing to download!', 'warning');
-    return;
-  }
+  if (!text) { showToast('Editor is empty. Nothing to download!', 'warning'); return; }
 
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
@@ -797,6 +998,7 @@ downloadTxtBtn.addEventListener('click', () => {
 
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const downloadUrl = URL.createObjectURL(blob);
+
   const a = document.createElement('a');
   a.href = downloadUrl;
   a.download = filename;
@@ -808,7 +1010,6 @@ downloadTxtBtn.addEventListener('click', () => {
   showToast('Transcript downloaded as .txt file!', 'success');
 });
 
-// Clear Text
 clearBtn.addEventListener('click', () => {
   if (!textEditor.value.trim()) return;
 
@@ -816,6 +1017,8 @@ clearBtn.addEventListener('click', () => {
     textEditor.value = '';
     finalTranscript = '';
     resultCount = 0;
+    clearSegments();
+    hideInterim();
     resetTimer();
     updateCounters();
     if (dbgResult) dbgResult.textContent = '0 results received';
@@ -823,57 +1026,34 @@ clearBtn.addEventListener('click', () => {
   }
 });
 
-// Select All
 selectAllBtn.addEventListener('click', () => {
-  if (!textEditor.value.trim()) {
-    showToast('Text editor is empty.', 'info');
-    return;
-  }
+  if (!textEditor.value.trim()) { showToast('Text editor is empty.', 'info'); return; }
   textEditor.focus();
   textEditor.select();
   showToast('All text selected.', 'info');
 });
 
 // -------------------------------------------------------------
-// 11. Button Event Listeners
+// 16. Button Listeners
 // -------------------------------------------------------------
 
-startBtn.addEventListener('click', () => {
-  resetTimer();
-  startSession();
-});
-
-pauseBtn.addEventListener('click', () => {
-  pauseSession();
-});
-
-resumeBtn.addEventListener('click', () => {
-  resumeSession();
-});
-
-stopBtn.addEventListener('click', () => {
-  stopSession();
-});
+startBtn.addEventListener('click', () => { resetTimer(); startSession(); });
+pauseBtn.addEventListener('click', () => { pauseSession(); });
+resumeBtn.addEventListener('click', () => { resumeSession(); });
+stopBtn.addEventListener('click', () => { stopSession(); });
 
 // -------------------------------------------------------------
-// 12. Keyboard Shortcuts
+// 17. Keyboard Shortcuts
 // -------------------------------------------------------------
 
 document.addEventListener('keydown', (e) => {
-  // Ctrl + Enter (or Cmd + Enter): Toggle Start/Resume or Pause
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
     e.preventDefault();
-    if (appState === 'recording') {
-      pauseSession();
-    } else if (appState === 'paused') {
-      resumeSession();
-    } else {
-      resetTimer();
-      startSession();
-    }
+    if (appState === 'recording') pauseSession();
+    else if (appState === 'paused') resumeSession();
+    else { resetTimer(); startSession(); }
   }
 
-  // Ctrl + Shift + C (or Cmd + Shift + C): Copy Text
   if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
     e.preventDefault();
     copyBtn.click();
@@ -881,7 +1061,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 // -------------------------------------------------------------
-// 13. Light / Dark Theme Toggle
+// 18. Light / Dark Theme
 // -------------------------------------------------------------
 
 function applyTheme(isDark) {
@@ -900,32 +1080,31 @@ function applyTheme(isDark) {
 }
 
 themeToggleBtn.addEventListener('click', () => {
-  const isCurrentlyDark = document.documentElement.classList.contains('dark');
-  applyTheme(!isCurrentlyDark);
+  applyTheme(!document.documentElement.classList.contains('dark'));
 });
 
 // -------------------------------------------------------------
-// 14. Bootstrapping
+// 19. Bootstrap
 // -------------------------------------------------------------
 
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
   lucide.createIcons();
 
-  // Load saved theme
-  const savedTheme = localStorage.getItem('voicetype_theme') || 'light';
-  applyTheme(savedTheme === 'dark');
+  applyTheme((localStorage.getItem('voicetype_theme') || 'light') === 'dark');
 
-  // Verify microphone permissions
   checkMicrophonePermission();
-
-  // Initialize controls & counters
   updateControls();
   updateStatus('ready');
   updateCounters();
-
-  // Initialize language detection with Malayalam as default
   updateLanguageUI(LANG_CONFIG.MALAYALAM);
 
-  // Initialize speech recognition
-  recognition = initSpeechRecognition();
+  // Pre-flight: is the server engine available? If not, prepare the fallback.
+  const configured = await probeServerEngine();
+  if (configured) {
+    showToast('Multilingual engine ready — press Start and speak.', 'success');
+  } else {
+    recognition = initSpeechRecognition();
+    if (!recognition && unsupportedAlert) unsupportedAlert.classList.remove('hidden');
+    showToast('Server engine not configured — using browser speech engine.', 'warning');
+  }
 });
